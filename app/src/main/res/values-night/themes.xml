@@ -1,0 +1,4 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Dark window theme used before Compose draws. -->
+    <style name="Theme.AndresMusicPlayer" parent="android:Theme.Material.NoActionBar" />
+</resources>

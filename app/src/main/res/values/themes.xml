@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      Compose handles app theming (see ui/theme/Theme.kt). This XML theme only
+      controls the window before Compose draws, so it just needs a NoActionBar
+      base. Light variant here; dark variant in values-night.
+    -->
+    <style name="Theme.AndresMusicPlayer" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
