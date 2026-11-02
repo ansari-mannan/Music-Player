@@ -3,7 +3,7 @@ package com.andres.musicplayer.data.scan
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
+import android.provider.DocumentsContract
 import com.andres.musicplayer.data.local.entity.Song
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -44,12 +44,12 @@ class MediaScanner(private val context: Context) {
         onProgress: (scanned: Int, total: Int) -> Unit = { _, _ -> },
     ): Result =
         withContext(Dispatchers.IO) {
-            val root = DocumentFile.fromTreeUri(context, treeUri)
+            val rootId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
                 ?: return@withContext Result(emptyList(), totalAudioFound = 0, allFoundUris = emptyList())
 
             val audioFiles = mutableListOf<FoundFile>()
             // Start at the root with no subfolder; it's set once when descending one level.
-            collectAudioFiles(root, subfolder = null, out = audioFiles)
+            collectAudioFiles(treeUri, rootId, subfolder = null, out = audioFiles)
 
             val total = audioFiles.size
             onProgress(0, total)
@@ -57,14 +57,14 @@ class MediaScanner(private val context: Context) {
             val allFoundUris = ArrayList<String>(total)
             val newSongs = mutableListOf<ScannedSong>()
             audioFiles.forEachIndexed { index, found ->
-                val uriString = found.file.uri.toString()
+                val uriString = found.uri.toString()
                 if (uriString in knownUris) {
                     allFoundUris += uriString
                 } else {
                     // Null means it turned out to be video (an .mp4/.webm that isn't
                     // audio) or unreadable — leave it out of the library entirely, and
                     // out of allFoundUris so it isn't mistaken for a live song.
-                    val song = readSong(found.file)
+                    val song = readSong(found.uri, found.name)
                     if (song != null) {
                         allFoundUris += uriString
                         newSongs += ScannedSong(song, found.subfolder)
@@ -81,26 +81,58 @@ class MediaScanner(private val context: Context) {
         }
 
     /** A discovered file paired with the root subfolder it lives under (null = loose in root). */
-    private data class FoundFile(val file: DocumentFile, val subfolder: String?)
+    private data class FoundFile(val uri: Uri, val name: String, val subfolder: String?)
 
-    private fun collectAudioFiles(dir: DocumentFile, subfolder: String?, out: MutableList<FoundFile>) {
-        for (child in dir.listFiles()) {
-            when {
-                // First descent from root sets the subfolder; deeper levels keep it.
-                child.isDirectory -> collectAudioFiles(child, subfolder ?: child.name, out)
-                isSupportedAudio(child) -> out += FoundFile(child, subfolder)
+    /**
+     * Lists the tree with one [DocumentsContract] query per folder, asking only for the
+     * three columns needed. `DocumentFile.listFiles()` returned bare handles, and every
+     * `isDirectory` / `name` / `type` call on them was a separate provider round trip —
+     * three IPC queries per file, on every app launch.
+     *
+     * Uris are built exactly as `DocumentFile` builds them (tree uri + document id), so
+     * they match the ones already stored in the library.
+     */
+    private fun collectAudioFiles(
+        treeUri: Uri,
+        parentId: String,
+        subfolder: String?,
+        out: MutableList<FoundFile>,
+    ) {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+        val folders = mutableListOf<Pair<String, String>>()
+        runCatching {
+            context.contentResolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
+        }.getOrNull()?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val id = cursor.getString(0) ?: continue
+                val name = cursor.getString(1).orEmpty()
+                val mime = cursor.getString(2).orEmpty()
+                when {
+                    mime == DocumentsContract.Document.MIME_TYPE_DIR -> folders += id to name
+                    isSupportedAudio(name, mime) -> out += FoundFile(
+                        DocumentsContract.buildDocumentUriUsingTree(treeUri, id),
+                        name,
+                        subfolder,
+                    )
+                }
             }
         }
+        // First descent from root sets the subfolder; deeper levels keep it.
+        folders.forEach { (id, name) -> collectAudioFiles(treeUri, id, subfolder ?: name, out) }
     }
 
-    private fun isSupportedAudio(file: DocumentFile): Boolean {
-        if (!file.isFile) return false
-        val name = file.name?.lowercase().orEmpty()
-        val extension = name.substringAfterLast('.', "")
-        return extension in AUDIO_EXTENSIONS || file.type in AUDIO_MIME_TYPES
+    private fun isSupportedAudio(name: String, mime: String): Boolean {
+        val extension = name.lowercase().substringAfterLast('.', "")
+        return extension in AUDIO_EXTENSIONS || mime in AUDIO_MIME_TYPES
     }
 
     private companion object {
+        val CHILD_PROJECTION = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
+
         /**
          * `.mp4` and `.webm` are container extensions that can hold video too — a video
          * file dropped in the music folder would be picked up here, but [readSong]
@@ -121,9 +153,8 @@ class MediaScanner(private val context: Context) {
      * Reads one file into a [Song], or returns null if it shouldn't be in the library:
      * a container that turned out to hold video, or a file that has no audio at all.
      */
-    private fun readSong(file: DocumentFile): Song? {
-        val uri = file.uri
-        val displayName = file.name ?: "Unknown"
+    private fun readSong(uri: Uri, name: String): Song? {
+        val displayName = name.ifBlank { "Unknown" }
         val fallbackTitle = displayName.substringBeforeLast(".", displayName)
 
         val retriever = MediaMetadataRetriever()

@@ -32,9 +32,21 @@ class ScanLibraryUseCase(
         // Skip device-imported (Browse) songs — their content://media uris aren't part
         // of the watched SAF tree, so they'd otherwise be wiped on every scan.
         val foundUris = result.allFoundUris.toSet()
-        val orphanIds = known.entries
+        val orphans = known.entries
             .filter { it.key !in foundUris && !it.key.startsWith("content://media") }
-            .map { it.value }
+        // Safety net: if the scan found files but recognised *none* of the songs already
+        // in the library from this same folder, the likelier story is that file uris
+        // changed shape, not that every song was deleted — and wiping the library would
+        // take every playlist link with it. Keep them and let the user decide.
+        val treePrefix = "$treeUri/document/"
+        val knownInTree = known.keys.count { it.startsWith(treePrefix) }
+        val orphansInTree = orphans.count { it.key.startsWith(treePrefix) }
+        // Inserting would only duplicate the whole library under the new uris, so the
+        // scan changes nothing at all in that case.
+        if (foundUris.isNotEmpty() && knownInTree > 0 && orphansInTree == knownInTree) {
+            return Summary(added = 0, removed = 0, totalFound = result.totalAudioFound, autoPlaylisted = 0)
+        }
+        val orphanIds = orphans.map { it.value }
         if (orphanIds.isNotEmpty()) repository.deleteSongs(orphanIds)
 
         // Insert new songs; ids come back in the same order, so we can pair them back up
