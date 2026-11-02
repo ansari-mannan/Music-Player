@@ -181,6 +181,8 @@ fun AppRoot(settings: SettingsState) {
     LaunchedEffect(Unit) {
         if (!autoScanned && folderUri != null) {
             autoScanned = true
+            // Before the scan, so the library reads the repaired files' tags.
+            if (repo.repairDamagedM4aFilesOnce() > 0) ArtworkVersion.bump()
             runScan()
         }
     }

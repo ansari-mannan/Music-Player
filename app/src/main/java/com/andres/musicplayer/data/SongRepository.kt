@@ -3,6 +3,7 @@ package com.andres.musicplayer.data
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.andres.musicplayer.data.local.AppDatabase
 import com.andres.musicplayer.data.local.dao.PlaylistDao
@@ -12,6 +13,7 @@ import com.andres.musicplayer.data.local.entity.PlaylistSongCrossRef
 import com.andres.musicplayer.data.local.entity.PlaylistWithSongs
 import com.andres.musicplayer.data.local.entity.Song
 import com.andres.musicplayer.data.tags.AudioTags
+import com.andres.musicplayer.data.tags.Mp4Tag
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -130,6 +132,52 @@ class SongRepository(
         MetadataSyncResult(written = written, skipped = all.size - written)
     }
 
+    /**
+     * One-time fix for M4A files the old tag writer damaged: it put `moov` after the audio
+     * fragments, so those tracks played silence until the user seeked, and Android's
+     * metadata reader often missed their artist, album and cover art too.
+     *
+     * Runs once per install (flag set only after a complete pass, so an interrupted one
+     * tries again next launch). Returns how many files were rewritten.
+     */
+    suspend fun repairDamagedM4aFilesOnce(): Int = withContext(Dispatchers.IO) {
+        val flags = appContext.getSharedPreferences(MAINTENANCE_PREFS, Context.MODE_PRIVATE)
+        if (flags.getBoolean(KEY_M4A_LAYOUT_REPAIRED, false)) return@withContext 0
+
+        var repaired = 0
+        songDao.getAllOnce()
+            .filter { it.uri.contains("/document/") }
+            .forEach { song ->
+                if (Mp4Tag.repairFragmentedLayout(appContext, song.uri)) {
+                    repaired++
+                    refreshMissingInfo(song)
+                }
+            }
+        flags.edit().putBoolean(KEY_M4A_LAYOUT_REPAIRED, true).apply()
+        repaired
+    }
+
+    /** Re-reads a repaired file and fills in whatever the first scan couldn't see. */
+    private suspend fun refreshMissingInfo(song: Song) {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(appContext, Uri.parse(song.uri))
+            songDao.fillMissingInfo(
+                id = song.id,
+                artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                    ?.takeIf { it.isNotBlank() },
+                album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
+                    ?.takeIf { it.isNotBlank() },
+                durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull() ?: 0L,
+            )
+        } catch (_: Exception) {
+            // The file itself is fixed either way; the library row just stays as it was.
+        } finally {
+            retriever.release()
+        }
+    }
+
     // --- Cover art (embedded permanently into the MP3 files) ---
 
     /**
@@ -224,6 +272,9 @@ class SongRepository(
     }
 
     companion object {
+        private const val MAINTENANCE_PREFS = "library_maintenance"
+        private const val KEY_M4A_LAYOUT_REPAIRED = "m4a_fragment_layout_repaired_v1"
+
         fun from(context: Context): SongRepository {
             val db = AppDatabase.getInstance(context)
             return SongRepository(

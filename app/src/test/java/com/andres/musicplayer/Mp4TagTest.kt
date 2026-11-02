@@ -328,13 +328,86 @@ class Mp4TagTest {
         assertNull(Mp4Tag.coverArtSize(realM4a()))
     }
 
-    /** A fresh copy each time, since every test here writes to it. */
-    private fun realM4a(): File {
-        val bytes = checkNotNull(javaClass.getResourceAsStream("/$REAL_M4A")) {
-            "test resource $REAL_M4A is missing"
-        }.use { it.readBytes() }
-        return write(bytes)
+    // --- Fragmented MP4 (what YouTube actually serves) ------------------------------------
+
+    /**
+     * YouTube's m4a audio is fragmented: `ftyp, moov, sidx, moof, mdat, moof, mdat…`.
+     * Players read `moov` before the first `moof`; a fragment seen before the track list is
+     * skipped. The old writer appended `moov` at the end, which played silence from the
+     * start and only made sound after a seek — this is that bug's regression test.
+     */
+    @Test
+    fun `a fragmented m4a keeps moov ahead of its fragments`() {
+        val file = fragmentedM4a()
+        val before = file.readBytes()
+        val media = fragmentRegion(before)
+        val jpeg = fakeJpeg(24 * 1024)
+
+        assertTrue(Mp4Tag.rewrite(file, "Tone", "Artist", "Album", jpeg, "image/jpeg"))
+
+        val after = file.readBytes()
+        val types = boxes(after).map { it.type }
+        assertEquals(listOf("ftyp", "moov", "sidx", "moof"), types.take(4))
+        assertEquals(1, types.count { it == "moov" })
+        assertFalse("mfra holds absolute offsets and must not survive a shift", "mfra" in types)
+        assertArrayEquals(
+            "sidx and every fragment must be byte-identical and contiguous",
+            media,
+            fragmentRegion(after),
+        )
+        assertEquals(after.size.toLong(), boxes(after).sumOf { it.size })
+        assertEquals("Tone", readItem(after, "©nam"))
+        assertEquals(jpeg.size, Mp4Tag.coverArtSize(file))
+        assertFalse(Mp4Tag.needsFragmentRelayout(file))
     }
+
+    @Test
+    fun `a fragmented file broken by the old writer is repaired by any rewrite`() {
+        // Rebuild exactly what the old writer produced: moov blanked into a same-size free
+        // box where it stood, and the new moov appended after everything else.
+        val original = fragmentedM4a().readBytes()
+        val moov = boxes(original).first { it.type == "moov" }
+        val moovBytes = original.copyOfRange(moov.offset.toInt(), (moov.offset + moov.size).toInt())
+        val broken = original.copyOf().also { bytes ->
+            val free = box("free", ByteArray(moov.size.toInt() - 8))
+            System.arraycopy(free, 0, bytes, moov.offset.toInt(), free.size)
+        } + moovBytes
+        val file = write(broken)
+        assertTrue(Mp4Tag.needsFragmentRelayout(file))
+
+        assertTrue(Mp4Tag.rewrite(file, null, null, null, null, null))
+
+        val after = file.readBytes()
+        assertEquals(listOf("ftyp", "moov", "sidx"), boxes(after).map { it.type }.take(3))
+        assertFalse("the dead free box ahead of the fragments goes too", boxes(after).any { it.type == "free" })
+        assertArrayEquals(fragmentRegion(original), fragmentRegion(after))
+        assertFalse(Mp4Tag.needsFragmentRelayout(file))
+    }
+
+    @Test
+    fun `a healthy fragmented file does not need repair`() {
+        assertFalse(Mp4Tag.needsFragmentRelayout(fragmentedM4a()))
+        assertFalse(Mp4Tag.needsFragmentRelayout(realM4a()))
+    }
+
+    /** Everything from `sidx` through the last `mdat`: the part a relayout must not alter. */
+    private fun fragmentRegion(bytes: ByteArray): ByteArray {
+        val parsed = boxes(bytes)
+        val first = parsed.first { it.type == "sidx" }
+        val last = parsed.last { it.type == "mdat" }
+        return bytes.copyOfRange(first.offset.toInt(), (last.offset + last.size).toInt())
+    }
+
+    /** Three seconds of AAC from ffmpeg with `+frag_keyframe+empty_moov+default_base_moof+global_sidx`. */
+    private fun fragmentedM4a(): File = write(resource("sample_fragmented.m4a"))
+
+    /** A fresh copy each time, since every test here writes to it. */
+    private fun realM4a(): File = write(resource(REAL_M4A))
+
+    private fun resource(name: String): ByteArray =
+        checkNotNull(javaClass.getResourceAsStream("/$name")) {
+            "test resource $name is missing"
+        }.use { it.readBytes() }
 
     // --- Synthetic file construction ---------------------------------------------------
 

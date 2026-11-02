@@ -39,6 +39,17 @@ interface SongDao {
     @Query("UPDATE songs SET title = :title, artist = :artist, album = :album WHERE id = :id")
     suspend fun updateInfo(id: Long, title: String, artist: String?, album: String?)
 
+    /**
+     * Fills in metadata a scan couldn't read, without overwriting anything already there
+     * (including the user's own edits).
+     */
+    @Query(
+        "UPDATE songs SET artist = COALESCE(artist, :artist), album = COALESCE(album, :album), " +
+            "durationMs = CASE WHEN durationMs > 0 THEN durationMs ELSE :durationMs END " +
+            "WHERE id = :id",
+    )
+    suspend fun fillMissingInfo(id: Long, artist: String?, album: String?, durationMs: Long)
+
     /** Removes songs from the library. Playlist links cascade-delete via the FK. */
     @Query("DELETE FROM songs WHERE id IN (:ids)")
     suspend fun deleteByIds(ids: List<Long>)

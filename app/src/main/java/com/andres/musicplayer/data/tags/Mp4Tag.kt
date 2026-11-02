@@ -123,6 +123,12 @@ object Mp4Tag {
             val updated = updateMoov(moovBytes, title, artist, album, artwork, artworkMime)
                 ?: return false
 
+            // Fragmented files (every YouTube DASH download) need moov in front of the
+            // fragments, so the append-at-the-end trick below would break them.
+            if (boxes.any { it.type == "moof" }) {
+                return relayoutFragmented(raf, file, boxes, moovIndex, updated)
+            }
+
             val moovIsLast = boxes.drop(moovIndex + 1).all { it.type == "free" || it.type == "skip" }
             when {
                 // Same size: overwrite where it stands, nothing moves.
@@ -147,6 +153,166 @@ object Mp4Tag {
             }
         }
         return true
+    }
+
+    /**
+     * Rewrites a fragmented MP4 as `ftyp, moov, sidx, moof, mdat, …` with the new [moov].
+     *
+     * A fragmented file has no `stco` offsets to protect, which is the only reason the
+     * non-fragmented path refuses to move `mdat`. What it has instead is a hard ordering
+     * rule: players read `moov` before the first `moof`, and any fragment that arrives
+     * before the track list is skipped. Appending `moov` at the end — what this writer
+     * used to do to every file — produces a track that plays silence from the start and
+     * only makes sound once a seek jumps through `sidx` to a fragment it can now decode.
+     *
+     * Shifting the fragments is safe because everything inside them is relative: `sidx`
+     * points forward from its own end, and `trun` data offsets count from their `moof`.
+     * The two exceptions are handled explicitly: `mfra` (an optional random-access index of
+     * absolute offsets) is dropped, and a `tfhd` carrying an absolute base offset makes the
+     * edit refuse rather than corrupt the file.
+     *
+     * Also repairs files damaged by the old behaviour, whose `moov` sits at the very end
+     * behind a dead `free` box: those leading `free` boxes are dropped on the way through.
+     */
+    private fun relayoutFragmented(
+        raf: RandomAccessFile,
+        file: File,
+        boxes: List<Box>,
+        moovIndex: Int,
+        moov: ByteArray,
+    ): Boolean {
+        if (boxes.any { it.type == "moof" && hasAbsoluteBaseOffset(raf, it) }) return false
+        if (hasChunkOffsets(moov)) return false
+
+        val firstMedia = boxes.indexOfFirst { it.type in FRAGMENT_START_TYPES }
+        val temp = File(file.parentFile, file.name + ".relayout")
+        try {
+            temp.outputStream().buffered().use { out ->
+                boxes.forEachIndexed { index, box ->
+                    if (index == firstMedia) out.write(moov)
+                    val dropped = index == moovIndex ||
+                        box.type == "mfra" ||
+                        (index < firstMedia && (box.type == "free" || box.type == "skip"))
+                    if (!dropped) copyRange(raf, box.offset, box.size, out)
+                }
+            }
+            raf.seek(0)
+            temp.inputStream().use { input ->
+                val buffer = ByteArray(COPY_BUFFER_BYTES)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read == -1) break
+                    raf.write(buffer, 0, read)
+                }
+            }
+            raf.setLength(temp.length())
+        } finally {
+            temp.delete()
+        }
+        return true
+    }
+
+    /**
+     * True when [file] is a fragmented MP4 whose `moov` is not ahead of its fragments —
+     * the layout the old writer left behind, which plays silently until the user seeks.
+     */
+    internal fun needsFragmentRelayout(file: File): Boolean = runCatching {
+        RandomAccessFile(file, "r").use { raf -> needsFragmentRelayout(topLevelBoxes(raf)) }
+    }.getOrDefault(false)
+
+    private fun needsFragmentRelayout(boxes: List<Box>?): Boolean {
+        if (boxes == null) return false
+        val moov = boxes.indexOfFirst { it.type == "moov" }
+        val firstMedia = boxes.indexOfFirst { it.type in FRAGMENT_START_TYPES }
+        return moov >= 0 && firstMedia >= 0 && boxes.any { it.type == "moof" } && moov > firstMedia
+    }
+
+    /**
+     * Fixes a library file the old writer left with `moov` behind its fragments. Only the
+     * top-level box headers are read to decide, so calling this on a healthy file is cheap
+     * and changes nothing. Returns true only if the file was actually rewritten.
+     */
+    fun repairFragmentedLayout(context: Context, uriString: String): Boolean {
+        val uri = Uri.parse(uriString)
+        val resolver = context.contentResolver
+        // Header-only check straight off the document, so a healthy library is never copied.
+        val needsRepair = runCatching {
+            resolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                java.io.FileInputStream(pfd.fileDescriptor).channel.use { channel ->
+                    needsFragmentRelayout(
+                        topLevelBoxes(channel.size()) { position, buffer ->
+                            val wrapped = java.nio.ByteBuffer.wrap(buffer)
+                            while (wrapped.hasRemaining()) {
+                                if (channel.read(wrapped, position + wrapped.position()) < 0) {
+                                    throw java.io.EOFException()
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+        }.getOrNull() ?: false
+        if (!needsRepair) return false
+
+        val working = File.createTempFile("mp4fix", ".tmp", context.cacheDir)
+        return try {
+            resolver.openInputStream(uri)?.use { input ->
+                working.outputStream().use { input.copyTo(it) }
+            } ?: return false
+            // Same moov contents; the rewrite exists for its relayout side effect.
+            if (!rewrite(working, null, null, null, null, null)) return false
+            resolver.openOutputStream(uri, "wt")?.use { out ->
+                working.inputStream().use { it.copyTo(out) }
+            } ?: return false
+            true
+        } catch (_: Exception) {
+            false
+        } finally {
+            working.delete()
+        }
+    }
+
+    /** `tfhd` flag 0x000001: the fragment's data is addressed from an absolute file offset. */
+    private fun hasAbsoluteBaseOffset(raf: RandomAccessFile, moof: Box): Boolean {
+        if (moof.size > MAX_MOOV_BYTES) return true
+        val bytes = ByteArray(moof.size.toInt())
+        raf.seek(moof.offset)
+        raf.readFully(bytes)
+        val trafs = parseChildren(bytes, 8, bytes.size)?.filter { it.type == "traf" } ?: return true
+        return trafs.any { traf ->
+            val tfhd = parseChildren(bytes, traf.offset + 8, traf.offset + traf.size)
+                ?.firstOrNull { it.type == "tfhd" }
+                ?: return@any true
+            (readUInt32(bytes, tfhd.offset + 8) and 0x000001L) != 0L
+        }
+    }
+
+    /** True if any `stco`/`co64` in [moov] has entries — absolute offsets a shift would break. */
+    private fun hasChunkOffsets(moov: ByteArray): Boolean {
+        fun walk(from: Int, to: Int): Boolean {
+            val children = parseChildren(moov, from, to) ?: return true
+            return children.any { child ->
+                when (child.type) {
+                    "trak", "mdia", "minf", "stbl" -> walk(child.offset + 8, child.offset + child.size)
+                    // FullBox header (4 bytes), then a 32-bit entry count.
+                    "stco", "co64" -> readUInt32(moov, child.offset + 12) > 0
+                    else -> false
+                }
+            }
+        }
+        return walk(8, moov.size)
+    }
+
+    private fun copyRange(raf: RandomAccessFile, offset: Long, size: Long, out: java.io.OutputStream) {
+        val buffer = ByteArray(COPY_BUFFER_BYTES)
+        raf.seek(offset)
+        var remaining = size
+        while (remaining > 0) {
+            val read = raf.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+            if (read == -1) throw java.io.EOFException("Box ran past the end of the file")
+            out.write(buffer, 0, read)
+            remaining -= read
+        }
     }
 
     /**
@@ -180,14 +346,19 @@ object Mp4Tag {
     private class Box(val type: String, val offset: Long, val size: Long)
 
     /** Reads the top-level box list, or null if the file isn't a sane MP4. */
-    private fun topLevelBoxes(raf: RandomAccessFile): List<Box>? {
+    private fun topLevelBoxes(raf: RandomAccessFile): List<Box>? =
+        topLevelBoxes(raf.length()) { position, buffer ->
+            raf.seek(position)
+            raf.readFully(buffer)
+        }
+
+    /** Same walk over any random-access source: [readAt] fills the buffer from a position. */
+    private fun topLevelBoxes(length: Long, readAt: (Long, ByteArray) -> Unit): List<Box>? {
         val boxes = mutableListOf<Box>()
         var offset = 0L
-        val length = raf.length()
         val header = ByteArray(8)
         while (offset + 8 <= length) {
-            raf.seek(offset)
-            raf.readFully(header)
+            readAt(offset, header)
             var size = readUInt32(header, 0)
             val type = String(header, 4, 4, Charsets.ISO_8859_1)
             var headerSize = 8L
@@ -195,7 +366,7 @@ object Mp4Tag {
                 // 1 means the real size is in a 64-bit field after the type.
                 1L -> {
                     val large = ByteArray(8)
-                    raf.readFully(large)
+                    readAt(offset + 8, large)
                     size = readUInt64(large)
                     headerSize = 16L
                 }
@@ -383,4 +554,9 @@ object Mp4Tag {
 
     /** `data` box header plus its version/type/locale prefix, ahead of the value itself. */
     private const val DATA_BOX_OVERHEAD = 16
+
+    /** Boxes that begin the media part of a fragmented file; `moov` must precede them. */
+    private val FRAGMENT_START_TYPES = setOf("sidx", "styp", "moof", "mdat", "emsg", "prft")
+
+    private const val COPY_BUFFER_BYTES = 64 * 1024
 }
