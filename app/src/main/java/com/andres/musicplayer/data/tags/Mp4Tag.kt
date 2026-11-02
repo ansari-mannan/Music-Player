@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.OutputStream
 import java.io.RandomAccessFile
 
 /**
@@ -81,17 +82,139 @@ object Mp4Tag {
                 working.outputStream().use { input.copyTo(it) }
             } ?: return false
 
-            if (!rewrite(working, title, artist, album, artwork, artworkMime)) return false
-
-            resolver.openOutputStream(uri, "wt")?.use { out ->
-                working.inputStream().use { it.copyTo(out) }
-            } ?: return false
-            true
+            // Streamed straight back into the document: one local copy, not two. The
+            // output is only opened (and truncated) once the edit is known to be valid.
+            copyTagged(working, title, artist, album, artwork, artworkMime) {
+                resolver.openOutputStream(uri, "wt")
+            } != null
         } catch (_: Exception) {
             false
         } finally {
             working.delete()
         }
+    }
+
+    /** Outcome of [copyTagged]: how big the cover in the written file is, if it has one. */
+    internal class Tagged(val coverArtSize: Int?)
+
+    /**
+     * Writes a tagged copy of [source] into the stream [openOutput] returns, leaving
+     * [source] itself untouched. Returns null — without ever calling [openOutput] — if the
+     * layout isn't understood, so a caller can fall back to a plain copy.
+     *
+     * This is what lets a download go from its `.part` file to the music folder in a single
+     * pass, rather than being rewritten locally first and then copied.
+     */
+    internal fun copyTagged(
+        source: File,
+        title: String?,
+        artist: String?,
+        album: String?,
+        artwork: ByteArray?,
+        artworkMime: String?,
+        openOutput: () -> OutputStream?,
+    ): Tagged? {
+        RandomAccessFile(source, "r").use { raf ->
+            val plan = plan(raf, title, artist, album, artwork, artworkMime) ?: return null
+            val out = openOutput() ?: return null
+            out.buffered(COPY_BUFFER_BYTES).use { emit(raf, plan, it) }
+            return Tagged(coverArtSizeOf(plan.moov))
+        }
+    }
+
+    /** A tag edit worked out in full before a single byte is written anywhere. */
+    private class Plan(
+        val boxes: List<Box>,
+        val moovIndex: Int,
+        /** The new `moov`, metadata included. */
+        val moov: ByteArray,
+        val fragmented: Boolean,
+    )
+
+    /** Null if the file's layout isn't one this writer can edit safely. */
+    private fun plan(
+        raf: RandomAccessFile,
+        title: String?,
+        artist: String?,
+        album: String?,
+        artwork: ByteArray?,
+        artworkMime: String?,
+    ): Plan? {
+        val boxes = topLevelBoxes(raf) ?: return null
+        val moovIndex = boxes.indexOfFirst { it.type == "moov" }
+        if (moovIndex < 0) return null
+        val moov = boxes[moovIndex]
+
+        // moov is small (tens of KB); reading it whole keeps the edit simple.
+        if (moov.size > MAX_MOOV_BYTES) return null
+        val moovBytes = ByteArray(moov.size.toInt())
+        raf.seek(moov.offset)
+        raf.readFully(moovBytes)
+
+        val updated = updateMoov(moovBytes, title, artist, album, artwork, artworkMime)
+            ?: return null
+
+        // Fragmented files (every YouTube DASH download) need moov in front of the
+        // fragments; see relayout rules in [emit].
+        val fragmented = boxes.any { it.type == "moof" }
+        if (fragmented) {
+            if (boxes.any { it.type == "moof" && hasAbsoluteBaseOffset(raf, it) }) return null
+            if (hasChunkOffsets(updated)) return null
+        }
+        return Plan(boxes, moovIndex, updated, fragmented)
+    }
+
+    /**
+     * Writes the whole edited file to [out]. Produces exactly the bytes [rewrite] would
+     * leave on disk, so both paths share one definition of the layout rules.
+     *
+     * **Fragmented** files come out as `ftyp, moov, sidx, moof, mdat, …`. A fragmented
+     * file has no `stco` offsets to protect, which is the only reason the non-fragmented
+     * path refuses to move `mdat`. What it has instead is a hard ordering rule: players
+     * read `moov` before the first `moof`, and any fragment that arrives before the track
+     * list is skipped. Appending `moov` at the end — what this writer used to do to every
+     * file — produces a track that plays silence from the start and only makes sound once
+     * a seek jumps through `sidx` to a fragment it can now decode.
+     *
+     * Shifting the fragments is safe because everything inside them is relative: `sidx`
+     * points forward from its own end, and `trun` data offsets count from their `moof`.
+     * The two exceptions are handled in [plan] and here: `mfra` (an optional random-access
+     * index of absolute offsets) is dropped, and a `tfhd` carrying an absolute base offset
+     * makes the edit refuse rather than corrupt the file. Dead `free` boxes ahead of the
+     * fragments — what the old writer left behind — are dropped too.
+     *
+     * **Non-fragmented** files keep `mdat` at exactly the same offset, so every absolute
+     * offset in `stco`/`co64` stays valid (see the class doc).
+     */
+    private fun emit(raf: RandomAccessFile, plan: Plan, out: OutputStream) {
+        val boxes = plan.boxes
+        val oldMoov = boxes[plan.moovIndex]
+        if (plan.fragmented) {
+            val firstMedia = boxes.indexOfFirst { it.type in FRAGMENT_START_TYPES }
+            boxes.forEachIndexed { index, box ->
+                if (index == firstMedia) out.write(plan.moov)
+                val dropped = index == plan.moovIndex ||
+                    box.type == "mfra" ||
+                    (index < firstMedia && (box.type == "free" || box.type == "skip"))
+                if (!dropped) copyRange(raf, box.offset, box.size, out)
+            }
+            return
+        }
+        val sameSize = plan.moov.size.toLong() == oldMoov.size
+        val moovIsLast = boxes.drop(plan.moovIndex + 1).all { it.type == "free" || it.type == "skip" }
+        boxes.forEachIndexed { index, box ->
+            when {
+                index < plan.moovIndex -> copyRange(raf, box.offset, box.size, out)
+                index == plan.moovIndex -> when {
+                    sameSize || moovIsLast -> out.write(plan.moov)
+                    else -> out.write(freeBox(oldMoov.size))
+                }
+                // Trailing padding after a last moov is dropped, as rewrite() truncates it.
+                moovIsLast && !sameSize -> Unit
+                else -> copyRange(raf, box.offset, box.size, out)
+            }
+        }
+        if (!sameSize && !moovIsLast) out.write(plan.moov)
     }
 
     /**
@@ -109,27 +232,15 @@ object Mp4Tag {
         artworkMime: String?,
     ): Boolean {
         RandomAccessFile(file, "rw").use { raf ->
-            val boxes = topLevelBoxes(raf) ?: return false
-            val moovIndex = boxes.indexOfFirst { it.type == "moov" }
-            if (moovIndex < 0) return false
-            val moov = boxes[moovIndex]
-
-            // moov is small (tens of KB); reading it whole keeps the edit simple.
-            if (moov.size > MAX_MOOV_BYTES) return false
-            val moovBytes = ByteArray(moov.size.toInt())
-            raf.seek(moov.offset)
-            raf.readFully(moovBytes)
-
-            val updated = updateMoov(moovBytes, title, artist, album, artwork, artworkMime)
-                ?: return false
-
-            // Fragmented files (every YouTube DASH download) need moov in front of the
-            // fragments, so the append-at-the-end trick below would break them.
-            if (boxes.any { it.type == "moof" }) {
-                return relayoutFragmented(raf, file, boxes, moovIndex, updated)
+            val plan = plan(raf, title, artist, album, artwork, artworkMime) ?: return false
+            if (plan.fragmented) {
+                relayoutFragmented(raf, file, plan)
+                return true
             }
-
-            val moovIsLast = boxes.drop(moovIndex + 1).all { it.type == "free" || it.type == "skip" }
+            val boxes = plan.boxes
+            val moov = boxes[plan.moovIndex]
+            val updated = plan.moov
+            val moovIsLast = boxes.drop(plan.moovIndex + 1).all { it.type == "free" || it.type == "skip" }
             when {
                 // Same size: overwrite where it stands, nothing moves.
                 updated.size.toLong() == moov.size -> {
@@ -156,46 +267,14 @@ object Mp4Tag {
     }
 
     /**
-     * Rewrites a fragmented MP4 as `ftyp, moov, sidx, moof, mdat, …` with the new [moov].
-     *
-     * A fragmented file has no `stco` offsets to protect, which is the only reason the
-     * non-fragmented path refuses to move `mdat`. What it has instead is a hard ordering
-     * rule: players read `moov` before the first `moof`, and any fragment that arrives
-     * before the track list is skipped. Appending `moov` at the end — what this writer
-     * used to do to every file — produces a track that plays silence from the start and
-     * only makes sound once a seek jumps through `sidx` to a fragment it can now decode.
-     *
-     * Shifting the fragments is safe because everything inside them is relative: `sidx`
-     * points forward from its own end, and `trun` data offsets count from their `moof`.
-     * The two exceptions are handled explicitly: `mfra` (an optional random-access index of
-     * absolute offsets) is dropped, and a `tfhd` carrying an absolute base offset makes the
-     * edit refuse rather than corrupt the file.
-     *
-     * Also repairs files damaged by the old behaviour, whose `moov` sits at the very end
-     * behind a dead `free` box: those leading `free` boxes are dropped on the way through.
+     * In-place form of the fragmented layout in [emit]. The fragments shift, so this goes
+     * through a temporary file; callers that end up copying the result elsewhere anyway
+     * should use [copyTagged] and skip that extra pass.
      */
-    private fun relayoutFragmented(
-        raf: RandomAccessFile,
-        file: File,
-        boxes: List<Box>,
-        moovIndex: Int,
-        moov: ByteArray,
-    ): Boolean {
-        if (boxes.any { it.type == "moof" && hasAbsoluteBaseOffset(raf, it) }) return false
-        if (hasChunkOffsets(moov)) return false
-
-        val firstMedia = boxes.indexOfFirst { it.type in FRAGMENT_START_TYPES }
+    private fun relayoutFragmented(raf: RandomAccessFile, file: File, plan: Plan) {
         val temp = File(file.parentFile, file.name + ".relayout")
         try {
-            temp.outputStream().buffered().use { out ->
-                boxes.forEachIndexed { index, box ->
-                    if (index == firstMedia) out.write(moov)
-                    val dropped = index == moovIndex ||
-                        box.type == "mfra" ||
-                        (index < firstMedia && (box.type == "free" || box.type == "skip"))
-                    if (!dropped) copyRange(raf, box.offset, box.size, out)
-                }
-            }
+            temp.outputStream().buffered(COPY_BUFFER_BYTES).use { emit(raf, plan, it) }
             raf.seek(0)
             temp.inputStream().use { input ->
                 val buffer = ByteArray(COPY_BUFFER_BYTES)
@@ -209,7 +288,6 @@ object Mp4Tag {
         } finally {
             temp.delete()
         }
-        return true
     }
 
     /**
@@ -259,12 +337,10 @@ object Mp4Tag {
             resolver.openInputStream(uri)?.use { input ->
                 working.outputStream().use { input.copyTo(it) }
             } ?: return false
-            // Same moov contents; the rewrite exists for its relayout side effect.
-            if (!rewrite(working, null, null, null, null, null)) return false
-            resolver.openOutputStream(uri, "wt")?.use { out ->
-                working.inputStream().use { it.copyTo(out) }
-            } ?: return false
-            true
+            // Same moov contents; the write exists for its relayout side effect.
+            copyTagged(working, null, null, null, null, null) {
+                resolver.openOutputStream(uri, "wt")
+            } != null
         } catch (_: Exception) {
             false
         } finally {
@@ -330,15 +406,19 @@ object Mp4Tag {
             val moovBytes = ByteArray(moov.size.toInt())
             raf.seek(moov.offset)
             raf.readFully(moovBytes)
-
-            val children = parseChildren(moovBytes, 8, moovBytes.size) ?: return null
-            val udta = children.firstOrNull { it.type == "udta" } ?: return null
-            val ilst = findIlst(moovBytes, udta) ?: return null
-            val payload = parseIlstItems(moovBytes, ilst)[ATOM_COVER] ?: return null
-            // The payload is the whole `data` box: its 8-byte header, then 8 bytes of
-            // version/type/locale, then the image.
-            (payload.size - DATA_BOX_OVERHEAD).takeIf { it > 0 }
+            coverArtSizeOf(moovBytes)
         }
+    }.getOrNull()
+
+    /** Cover image size inside a complete `moov` box, or null if it carries none. */
+    private fun coverArtSizeOf(moovBytes: ByteArray): Int? = runCatching {
+        val children = parseChildren(moovBytes, 8, moovBytes.size) ?: return null
+        val udta = children.firstOrNull { it.type == "udta" } ?: return null
+        val ilst = findIlst(moovBytes, udta) ?: return null
+        val payload = parseIlstItems(moovBytes, ilst)[ATOM_COVER] ?: return null
+        // The payload is the whole `data` box: its 8-byte header, then 8 bytes of
+        // version/type/locale, then the image.
+        (payload.size - DATA_BOX_OVERHEAD).takeIf { it > 0 }
     }.getOrNull()
 
     // --- Box tree ------------------------------------------------------------------

@@ -390,6 +390,45 @@ class Mp4TagTest {
         assertFalse(Mp4Tag.needsFragmentRelayout(realM4a()))
     }
 
+    /**
+     * Downloads now go from `.part` to the music folder through [Mp4Tag.copyTagged] in one
+     * pass, so it must produce byte-for-byte what the in-place writer would, for every
+     * layout, and must never touch its source.
+     */
+    @Test
+    fun `a streamed tagged copy matches an in-place rewrite and leaves the source alone`() {
+        val jpeg = fakeJpeg(8 * 1024)
+        val fixtures = listOf(
+            fragmentedM4a().readBytes(),
+            realM4a().readBytes(),
+            buildMp4(moovFirst = true),
+            buildMp4(moovFirst = false),
+        )
+        for (original in fixtures) {
+            val inPlace = write(original)
+            assertTrue(Mp4Tag.rewrite(inPlace, "T", "A", "B", jpeg, "image/jpeg"))
+
+            val source = write(original)
+            val streamed = java.io.ByteArrayOutputStream()
+            val result = Mp4Tag.copyTagged(source, "T", "A", "B", jpeg, "image/jpeg") { streamed }
+
+            assertArrayEquals(inPlace.readBytes(), streamed.toByteArray())
+            assertArrayEquals("the source must not be modified", original, source.readBytes())
+            assertEquals(jpeg.size, result?.coverArtSize)
+        }
+    }
+
+    @Test
+    fun `a streamed copy refuses without ever opening the output`() {
+        var opened = false
+        val result = Mp4Tag.copyTagged(write("not an mp4 at all".toByteArray()), "T", null, null, null, null) {
+            opened = true
+            java.io.ByteArrayOutputStream()
+        }
+        assertNull(result)
+        assertFalse("a refused edit must not truncate the destination", opened)
+    }
+
     /** Everything from `sidx` through the last `mdat`: the part a relayout must not alter. */
     private fun fragmentRegion(bytes: ByteArray): ByteArray {
         val parsed = boxes(bytes)

@@ -30,6 +30,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -48,6 +49,7 @@ import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
+import kotlin.coroutines.coroutineContext
 
 /** Live byte counts for one running download, for a progress bar that moves smoothly. */
 data class DownloadProgress(val bytesDownloaded: Long, val totalBytes: Long?)
@@ -328,63 +330,102 @@ class DownloadEngine(
             part.parentFile?.mkdirs()
 
             // Trust the smaller of what the DB claims and what is really on disk; the
-            // two can diverge if the process died between a write and its persist.
-            var offset = minOf(part.length(), entry.bytesDownloaded).coerceAtLeast(0L)
+            // two can diverge if the process died between a write and its persist. The
+            // file is cut back to that point, because appending to a longer file would
+            // splice the same bytes in twice.
+            // A different size from last time means YouTube is now serving a different
+            // file (another format or encode), and resuming would splice two together.
+            val sameFile = entry.totalBytes == null || stream.contentLength == null ||
+                entry.totalBytes == stream.contentLength
+            if (!sameFile) total = null
+            val offset = if (sameFile) {
+                minOf(part.length(), entry.bytesDownloaded).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            if (part.exists() && part.length() != offset) {
+                java.io.RandomAccessFile(part, "rw").use { it.setLength(offset) }
+            }
+            written = offset
+            total = total ?: stream.contentLength
 
-            val request = Request.Builder()
-                .url(stream.url)
-                .apply { if (offset > 0) header("Range", "bytes=$offset-") }
-                .build()
+            java.io.FileOutputStream(part, true).use { out ->
+                val buffer = ByteArray(BUFFER_BYTES)
+                var lastPersist = System.currentTimeMillis()
+                var lastEmit = 0L
 
-            http.newCall(request).execute().use { response ->
-                when {
-                    response.code == 206 -> Unit
-                    response.isSuccessful -> {
-                        // Range ignored (or never asked for): start the file over.
-                        offset = 0L
-                    }
-                    response.code == 416 -> {
-                        // Asked past the end — the partial is bad, not the video.
-                        offset = 0L
-                        throw RestartFromScratch()
-                    }
-                    else -> throw IOException("Download failed (HTTP ${response.code}).")
-                }
+                // Bounded ranges rather than one open-ended request: YouTube throttles a
+                // single long-lived stream to roughly playback speed, but serves each
+                // bounded chunk at full speed. Connections are pooled, so the extra
+                // requests cost a few headers each.
+                while (total == null || written < total!!) {
+                    val chunkEnd = (written + CHUNK_BYTES - 1)
+                        .let { end -> total?.let { minOf(end, it - 1) } ?: end }
+                    val request = Request.Builder()
+                        .url(stream.url)
+                        .header("Range", "bytes=$written-$chunkEnd")
+                        .build()
 
-                val body = response.body ?: throw IOException("Empty response from YouTube.")
-                total = contentLength(response.header("Content-Range"), body.contentLength(), offset)
-                    ?: stream.contentLength
-                written = offset
-
-                if (offset == 0L && part.exists()) part.delete()
-                downloadDao.updateProgress(id, written, total)
-
-                java.io.FileOutputStream(part, offset > 0).use { out ->
-                    val buffer = ByteArray(BUFFER_BYTES)
-                    var lastPersist = System.currentTimeMillis()
-                    var lastEmit = 0L
-                    body.byteStream().use { input ->
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            out.write(buffer, 0, read)
-                            written += read
-
-                            val now = System.currentTimeMillis()
-                            if (now - lastEmit >= EMIT_INTERVAL_MS) {
-                                lastEmit = now
-                                setProgress(id, written, total)
+                    val chunkStart = written
+                    var wholeFile = false
+                    http.newCall(request).execute().use { response ->
+                        when {
+                            response.code == 206 -> Unit
+                            response.isSuccessful -> {
+                                // Range ignored: this response is the whole file, so the
+                                // partial is thrown away and replaced by it.
+                                wholeFile = true
+                                out.channel.truncate(0)
+                                written = 0L
                             }
-                            if (now - lastPersist >= PERSIST_INTERVAL_MS) {
-                                lastPersist = now
-                                withContext(NonCancellable) {
-                                    downloadDao.updateProgress(id, written, total)
+                            // Past the end with a known total means there is nothing left
+                            // to fetch; otherwise the partial is bad, not the video.
+                            response.code == 416 && total != null && written >= total!! -> return@use
+                            response.code == 416 -> throw RestartFromScratch()
+                            else -> throw IOException("Download failed (HTTP ${response.code}).")
+                        }
+
+                        val body = response.body ?: throw IOException("Empty response from YouTube.")
+                        if (wholeFile) {
+                            total = body.contentLength().takeIf { it > 0 } ?: total
+                        } else {
+                            totalFromContentRange(response.header("Content-Range"))?.let { total = it }
+                        }
+
+                        body.byteStream().use { input ->
+                            while (true) {
+                                // Without this the loop never notices a pause or cancel:
+                                // nothing in it suspends, so the bytes kept flowing.
+                                coroutineContext.ensureActive()
+                                val read = input.read(buffer)
+                                if (read == -1) break
+                                out.write(buffer, 0, read)
+                                written += read
+
+                                val now = System.currentTimeMillis()
+                                if (now - lastEmit >= EMIT_INTERVAL_MS) {
+                                    lastEmit = now
+                                    setProgress(id, written, total)
+                                }
+                                if (now - lastPersist >= PERSIST_INTERVAL_MS) {
+                                    lastPersist = now
+                                    out.flush()
+                                    withContext(NonCancellable) {
+                                        downloadDao.updateProgress(id, written, total)
+                                    }
                                 }
                             }
                         }
                     }
-                    out.fd.sync()
+                    if (wholeFile) break
+                    // A short or empty chunk with no known total is the end of the stream.
+                    if (written == chunkStart) break
+                    if (total == null && written - chunkStart < CHUNK_BYTES) break
                 }
+                out.fd.sync()
+            }
+            if (total != null && written < total!!) {
+                throw IOException("Download ended early ($written of $total bytes).")
             }
 
             finish(id, entry, part, stream, written, total)
@@ -420,12 +461,13 @@ class DownloadEngine(
         val extension = stream.fileExtension
         val title = stream.title
 
-        // Tagged before the copy so the library scanner only ever sees the finished file,
-        // art and all — and so a failure here costs nothing already in the music folder.
-        val hasArt = embedMetadata(id, part, entry, stream)
+        // Worked out before the music folder is touched, so the library scanner only ever
+        // sees the finished file, art and all.
+        val metadata = prepareMetadata(id, entry, stream)
 
         val fileName = "${sanitiseFileName(title.ifBlank { entry.videoId })}.$extension"
-        val destination = copyIntoWatchedFolder(Uri.parse(folder), fileName, part, extension)
+        val (destination, hasArt) =
+            writeIntoWatchedFolder(Uri.parse(folder), fileName, part, extension, entry.videoId, metadata)
 
         part.delete()
         downloadedVideoDao.insert(
@@ -443,39 +485,29 @@ class DownloadEngine(
         clearProgress(id)
     }
 
+    /** Tags to write into a finished download. */
+    private class TrackMetadata(val tags: TrackTags, val cover: ByteArray?)
+
     /**
-     * Writes title, artist, album and a square `covr` thumbnail into the downloaded file,
-     * so a fresh track arrives in the library already described rather than as a filename.
-     *
-     * Done on the `.part` file, before it is copied into the watched folder: the copy is a
-     * byte-for-byte stream of this exact file, so the tags travel with it, and a failure
-     * here costs nothing that is already in the user's music folder.
+     * Title, artist, album and a square `covr` thumbnail for the downloaded file, so a
+     * fresh track arrives in the library already described rather than as a filename.
      *
      * Deliberately best-effort: a track that transferred perfectly must never be marked
      * failed because YouTube's image server had a bad minute, so everything short of a
-     * cancellation is logged and swallowed, and missing art still leaves the text tags
-     * written. Only MP4-family containers are attempted — the tag writer understands
-     * nothing else, and would simply refuse a webm.
-     *
-     * Every outcome is logged at `DownloadEngine`, because "the audio downloaded fine" and
-     * "the metadata went in" are separate claims and this used to report only the first.
-     *
-     * Returns true only when a cover was written **and read back out of the file again**,
-     * which is what the Completed list records so it can stop showing artwork that only
-     * ever existed in the playlist listing.
+     * cancellation is logged and swallowed. Only MP4-family containers get any — the tag
+     * writer understands nothing else, and would simply refuse a webm.
      */
-    private suspend fun embedMetadata(
+    private suspend fun prepareMetadata(
         id: String,
-        part: File,
         entry: DownloadEntry,
         stream: ResolvedStream,
-    ): Boolean {
+    ): TrackMetadata? {
         val videoId = entry.videoId
         if (stream.fileExtension.lowercase() !in Mp4Tag.EXTENSIONS) {
             // Never silent. This branch hid a whole release worth of missing cover art:
             // an untaggable container looks exactly like a clean download from outside.
             Log.w(TAG, "No tag writer for .${stream.fileExtension} — $videoId stays untagged")
-            return false
+            return null
         }
         return try {
             val tags = deriveTags(
@@ -486,39 +518,12 @@ class DownloadEngine(
             )
             val cover = coverJpeg(entry, stream)
             if (cover == null) Log.w(TAG, "No cover art to embed for $videoId")
-
-            val written = Mp4Tag.rewrite(
-                file = part,
-                title = tags.title,
-                artist = tags.artist,
-                album = tags.album,
-                artwork = cover,
-                artworkMime = "image/jpeg",
-            )
-            if (!written) {
-                Log.w(TAG, "Tag writer refused the metadata for $videoId")
-                return false
-            }
-
-            // Read the atom back rather than trusting the return value: a successful write
-            // path and a cover that can actually be found again are different claims.
-            val embedded = Mp4Tag.coverArtSize(part)
-            val via = if (tags.fromMusicMetadata) "YT-Music metadata" else "heuristics"
-            Log.i(
-                TAG,
-                "Tagged $videoId via $via: artist=${tags.artist ?: "-"}, " +
-                    "album=${tags.album ?: "-"}, " +
-                    "cover=${embedded?.let { "$it bytes" } ?: "none"}",
-            )
-            if (cover != null && embedded == null) {
-                Log.w(TAG, "covr write reported success but no cover is readable in $videoId")
-            }
-            embedded != null
+            TrackMetadata(tags, cover)
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (e: Exception) {
-            Log.w(TAG, "Couldn't tag the download for $videoId", e)
-            false
+            Log.w(TAG, "Couldn't gather metadata for $videoId", e)
+            null
         }
     }
 
@@ -635,15 +640,23 @@ class DownloadEngine(
     private fun partFile(id: String) = File(File(appContext.filesDir, "downloads"), "$id.part")
 
     /**
-     * Copies the finished `.part` into the SAF-granted watched folder, de-duplicating the
-     * name rather than overwriting anything already there. Returns the destination uri.
+     * Writes the finished download into the SAF-granted watched folder in a single pass,
+     * tags applied on the way through, de-duplicating the name rather than overwriting
+     * anything already there. The `.part` itself is never modified, so a failure here
+     * leaves a complete download to retry from, and the half-written document is removed.
+     *
+     * Returns the destination uri, and whether a cover is in the written file — checked
+     * from the exact `moov` that was written rather than trusted from the image fetch, so
+     * the Completed list only shows artwork that really exists.
      */
-    private fun copyIntoWatchedFolder(
+    private fun writeIntoWatchedFolder(
         treeUri: Uri,
         fileName: String,
         source: File,
         extension: String,
-    ): String {
+        videoId: String,
+        metadata: TrackMetadata?,
+    ): Pair<String, Boolean> {
         val tree = DocumentFile.fromTreeUri(appContext, treeUri)
             ?: throw IOException("Music folder is no longer accessible.")
         if (!tree.canWrite()) throw IOException("No permission to write to the music folder.")
@@ -658,10 +671,48 @@ class DownloadEngine(
 
         val target = tree.createFile(mimeFor(extension), candidate)
             ?: throw IOException("Couldn't create the file in the music folder.")
-        appContext.contentResolver.openOutputStream(target.uri)?.use { out ->
-            source.inputStream().use { it.copyTo(out) }
-        } ?: throw IOException("Couldn't write into the music folder.")
-        return target.uri.toString()
+        val openOutput = { appContext.contentResolver.openOutputStream(target.uri, "wt") }
+        try {
+            var opened = false
+            val tagged = metadata?.let { m ->
+                try {
+                    Mp4Tag.copyTagged(
+                        source = source,
+                        title = m.tags.title,
+                        artist = m.tags.artist,
+                        album = m.tags.album,
+                        artwork = m.cover,
+                        artworkMime = "image/jpeg",
+                    ) { openOutput().also { opened = true } }
+                } catch (e: Exception) {
+                    // A failure once bytes are flowing is a failed write, not a tag problem.
+                    if (opened) throw e
+                    Log.w(TAG, "Couldn't tag the download for $videoId", e)
+                    null
+                }
+            }
+            if (tagged == null) {
+                if (metadata != null) Log.w(TAG, "Tag writer refused the metadata for $videoId")
+                (openOutput() ?: throw IOException("Couldn't write into the music folder.")).use { out ->
+                    source.inputStream().use { it.copyTo(out, BUFFER_BYTES) }
+                }
+            } else if (metadata != null) {
+                val via = if (metadata.tags.fromMusicMetadata) "YT-Music metadata" else "heuristics"
+                Log.i(
+                    TAG,
+                    "Tagged $videoId via $via: artist=${metadata.tags.artist ?: "-"}, " +
+                        "album=${metadata.tags.album ?: "-"}, " +
+                        "cover=${tagged.coverArtSize?.let { "$it bytes" } ?: "none"}",
+                )
+                if (metadata.cover != null && tagged.coverArtSize == null) {
+                    Log.w(TAG, "covr write reported success but no cover is readable in $videoId")
+                }
+            }
+            return target.uri.toString() to (tagged?.coverArtSize != null)
+        } catch (e: Exception) {
+            runCatching { target.delete() }
+            throw e
+        }
     }
 
     private fun mimeFor(extension: String) = when (extension.lowercase()) {
@@ -681,12 +732,9 @@ class DownloadEngine(
         _progress.value = _progress.value - id
     }
 
-    /** Total size from `Content-Range` when resuming, else `Content-Length` plus offset. */
-    private fun contentLength(contentRange: String?, bodyLength: Long, offset: Long): Long? {
-        contentRange?.substringAfter('/', "")?.toLongOrNull()?.let { return it }
-        if (bodyLength <= 0) return null
-        return bodyLength + offset
-    }
+    /** The whole file's size from a `Content-Range: bytes a-b/total` header, if stated. */
+    private fun totalFromContentRange(contentRange: String?): Long? =
+        contentRange?.substringAfter('/', "")?.toLongOrNull()?.takeIf { it > 0 }
 
     /** Thrown to restart a download whose partial file the server rejected. */
     private class RestartFromScratch : Exception()
@@ -694,6 +742,9 @@ class DownloadEngine(
     companion object {
         private const val TAG = "DownloadEngine"
         private const val BUFFER_BYTES = 64 * 1024
+
+        /** Per-request range; the size yt-dlp uses for YouTube to stay clear of throttling. */
+        private const val CHUNK_BYTES = 10L * 1024 * 1024
         private const val EMIT_INTERVAL_MS = 250L
         private const val PERSIST_INTERVAL_MS = 2_000L
 
