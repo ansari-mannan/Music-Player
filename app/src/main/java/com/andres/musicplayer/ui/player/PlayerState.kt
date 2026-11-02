@@ -23,6 +23,7 @@ import com.andres.musicplayer.data.prefs.PlaybackStatePreferences
 import com.andres.musicplayer.playback.PlaybackService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -104,6 +105,7 @@ class PlayerState(context: Context) {
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             isPlaying = player.isPlaying
+            if (isPlaying) ensureTicker()
             durationMs = player.duration.coerceAtLeast(0L)
             // The ticker below only runs while playing; a seek or track change while
             // paused would otherwise leave the bar showing the old position.
@@ -167,6 +169,7 @@ class PlayerState(context: Context) {
             // Shuffle is ours to manage: the player's own shuffle order stays off forever.
             c.shuffleModeEnabled = false
             isPlaying = c.isPlaying
+            if (isPlaying) ensureTicker()
             repeatMode = c.repeatMode
             speed = c.playbackParameters.speed
             currentIndex = c.currentMediaItemIndex.coerceAtLeast(0)
@@ -200,10 +203,22 @@ class PlayerState(context: Context) {
             prefs.edit().remove(KEY_SLEEP_END).apply()
         }
 
-        // Poll position (seek bar) and the sleep-timer countdown.
-        scope.launch {
+        if (sleepEndMs != null) ensureTicker()
+    }
+
+    private var ticker: Job? = null
+
+    /**
+     * Polls the position (seek bar) and the sleep-timer countdown — but only while one of
+     * them is actually moving. It stops itself once playback is paused and no timer is
+     * set, rather than waking the CPU twice a second for the life of the app.
+     */
+    private fun ensureTicker() {
+        if (ticker?.isActive == true) return
+        ticker = scope.launch {
             while (isActive) {
-                controller?.let { if (it.isPlaying) positionMs = it.currentPosition }
+                val playing = controller?.isPlaying == true
+                if (playing) controller?.let { positionMs = it.currentPosition }
                 val end = sleepEndMs
                 if (end != null) {
                     val remaining = end - SystemClock.elapsedRealtime()
@@ -217,6 +232,7 @@ class PlayerState(context: Context) {
                         sleepRemainingMs = remaining
                     }
                 }
+                if (!playing && sleepEndMs == null) break
                 delay(500)
             }
         }
@@ -515,6 +531,7 @@ class PlayerState(context: Context) {
             sleepEndMs = end
             sleepRemainingMs = minutes * 60_000L
             prefs.edit().putLong(KEY_SLEEP_END, end).apply()
+            ensureTicker()
         } else {
             sleepEndMs = null
             sleepRemainingMs = 0L
