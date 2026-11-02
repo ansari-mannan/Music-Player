@@ -8,7 +8,7 @@ import androidx.room.Transaction
 import com.andres.musicplayer.data.local.entity.Playlist
 import com.andres.musicplayer.data.local.entity.PlaylistSongCrossRef
 import com.andres.musicplayer.data.local.entity.PlaylistWithSongs
-import com.andres.musicplayer.data.local.entity.SongWithTags
+import com.andres.musicplayer.data.local.entity.Song
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -46,12 +46,11 @@ interface PlaylistDao {
     )
     suspend fun updateAddedAt(playlistId: Long, songId: Long, addedAt: Long)
 
-    @Transaction
     @Query(
         "SELECT songs.* FROM songs " +
             "INNER JOIN playlist_song_cross_ref ON songs.id = playlist_song_cross_ref.songId " +
             "WHERE playlist_song_cross_ref.playlistId = :playlistId " +
             "ORDER BY playlist_song_cross_ref.addedAt ASC",
     )
-    fun songsInPlaylist(playlistId: Long): Flow<List<SongWithTags>>
+    fun songsInPlaylist(playlistId: Long): Flow<List<Song>>
 }

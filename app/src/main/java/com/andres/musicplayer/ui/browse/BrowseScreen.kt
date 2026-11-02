@@ -151,7 +151,7 @@ fun BrowseScreen(
                 }
             } else {
                 val folderSongs = remember(all, selectedFolder) {
-                    all.filter { it.folder == selectedFolder }.map { it.toSongWithTags() }
+                    all.filter { it.folder == selectedFolder }.map { it.toSong() }
                 }
                 var showFolderPicker by remember(selectedFolder) { mutableStateOf(false) }
                 Column(modifier = modifier.fillMaxSize()) {
@@ -195,7 +195,7 @@ fun BrowseScreen(
                     AddToPlaylistDialog(
                         playlists = playlists,
                         onPick = { playlistId ->
-                            val toAdd = folderSongs.map { it.song }
+                            val toAdd = folderSongs
                             scope.launch {
                                 val ids = repo.importAndGetIds(toAdd)
                                 repo.addSongsToPlaylist(playlistId, ids)
@@ -203,7 +203,7 @@ fun BrowseScreen(
                             showFolderPicker = false
                         },
                         onCreateNew = { name ->
-                            val toAdd = folderSongs.map { it.song }
+                            val toAdd = folderSongs
                             scope.launch {
                                 val ids = repo.importAndGetIds(toAdd)
                                 val id = repo.createPlaylist(name)

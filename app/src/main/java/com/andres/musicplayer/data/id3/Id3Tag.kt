@@ -11,9 +11,9 @@ import java.io.InputStream
 
 /**
  * A tiny, dependency-free ID3v2 read-modify-write helper for MP3 files behind SAF
- * document uris. It preserves every existing frame (album art, etc.) and only touches
- * what we ask it to: the title/artist/album text frames and a dedicated user-defined
- * [MOODS_DESC] TXXX frame that carries this app's moods so they survive a DB wipe.
+ * document uris. It preserves every existing frame (album art, any TXXX frames written
+ * by other tools, etc.) and only touches what we ask it to: the title/artist/album
+ * text frames and the cover-art APIC frame.
  *
  * Writes are emitted as ID3v2.3 with UTF-16 text. Reads understand v2.3 and v2.4.
  * Only standard tags (no per-frame unsync / extended headers) are handled; anything
@@ -21,24 +21,11 @@ import java.io.InputStream
  */
 object Id3Tag {
 
-    private const val MOODS_DESC = "MOODS"
-    private const val MOOD_SEPARATOR = ";"
-
     private class Frame(val id: String, val data: ByteArray)
-
-    /** Reads this app's saved moods from [uriString], or empty if none / unreadable. */
-    fun readMoods(context: Context, uriString: String): List<String> {
-        val frames = readFrames(context, uriString) ?: return emptyList()
-        val txxx = frames.firstOrNull { it.id == "TXXX" && decodeTxxx(it.data).first == MOODS_DESC }
-            ?: return emptyList()
-        val value = decodeTxxx(txxx.data).second
-        return value.split(MOOD_SEPARATOR).map { it.trim() }.filter { it.isNotEmpty() }
-    }
 
     /**
      * Updates the file's tag in place. Non-null [title]/[artist]/[album] replace those
-     * frames; null leaves them untouched. Non-null [moods] replaces the MOODS frame
-     * (empty list clears it); null leaves it untouched. Returns true on success.
+     * frames; null leaves them untouched. Returns true on success.
      *
      * Not all uris are writable (e.g. read-only grants, or MediaStore content uris):
      * callers should treat false as "couldn't persist to file".
@@ -49,7 +36,8 @@ object Id3Tag {
         title: String? = null,
         artist: String? = null,
         album: String? = null,
-        moods: List<String>? = null,
+        artwork: ByteArray? = null,
+        artworkMime: String? = null,
     ): Boolean {
         val uri = Uri.parse(uriString)
         val resolver = context.contentResolver
@@ -89,11 +77,10 @@ object Id3Tag {
             if (title != null) frames.replaceText("TIT2", title)
             if (artist != null) frames.replaceText("TPE1", artist)
             if (album != null) frames.replaceText("TALB", album)
-            if (moods != null) {
-                frames.removeAll { it.id == "TXXX" && decodeTxxx(it.data).first == MOODS_DESC }
-                if (moods.isNotEmpty()) {
-                    frames += Frame("TXXX", buildTxxxData(MOODS_DESC, moods.joinToString(MOOD_SEPARATOR)))
-                }
+            if (artwork != null) {
+                // Replace any existing embedded cover with the new front-cover picture.
+                frames.removeAll { it.id == "APIC" }
+                frames += Frame("APIC", buildApicData(artwork, artworkMime ?: "image/jpeg"))
             }
 
             // Phase 3: serialise the new tag and write tag + audio back over the file.
@@ -113,25 +100,6 @@ object Id3Tag {
     }
 
     // --- reading ---
-
-    private fun readFrames(context: Context, uriString: String): List<Frame>? = runCatching {
-        context.contentResolver.openInputStream(Uri.parse(uriString))?.use { rawInput ->
-            val input = BufferedInputStream(rawInput)
-            val header = ByteArray(10)
-            if (readFully(input, header) != 10) return null
-            if (header[0] != 'I'.code.toByte() || header[1] != 'D'.code.toByte() ||
-                header[2] != '3'.code.toByte()
-            ) {
-                return emptyList()
-            }
-            val major = header[3].toInt() and 0xFF
-            val flags = header[5].toInt() and 0xFF
-            if (flags and 0xC0 != 0) return emptyList()
-            val body = ByteArray(synchsafe(header, 6))
-            readFully(input, body)
-            parseFrames(body, major)
-        }
-    }.getOrNull()
 
     private fun parseFrames(body: ByteArray, major: Int): List<Frame> {
         val frames = mutableListOf<Frame>()
@@ -181,11 +149,19 @@ object Id3Tag {
         return out.toByteArray()
     }
 
-    private fun buildTxxxData(description: String, value: String): ByteArray {
+    /**
+     * APIC (attached picture) frame body for a front cover:
+     * encoding(1) + MIME(ISO-8859-1, null-terminated) + picture type(1=0x03 front
+     * cover) + description(null-terminated, empty) + raw image bytes.
+     */
+    private fun buildApicData(image: ByteArray, mime: String): ByteArray {
         val out = ByteArrayOutputStream()
-        out.write(0x01)
-        writeUtf16(out, description)
-        writeUtf16(out, value)
+        out.write(0x00) // text encoding: ISO-8859-1 (only used by the description)
+        out.write(mime.toByteArray(Charsets.ISO_8859_1))
+        out.write(0) // MIME terminator
+        out.write(0x03) // picture type: cover (front)
+        out.write(0) // empty description + terminator
+        out.write(image)
         return out.toByteArray()
     }
 
@@ -193,48 +169,6 @@ object Id3Tag {
         out.write(0xFF); out.write(0xFE) // little-endian BOM
         out.write(text.toByteArray(Charsets.UTF_16LE))
         out.write(0); out.write(0) // terminator
-    }
-
-    /** Splits a TXXX body into (description, value). */
-    private fun decodeTxxx(data: ByteArray): Pair<String, String> {
-        if (data.isEmpty()) return "" to ""
-        val encoding = data[0].toInt() and 0xFF
-        val payload = data.copyOfRange(1, data.size)
-        val parts = when (encoding) {
-            1, 2 -> splitUtf16(payload)
-            else -> splitSingleByte(payload, if (encoding == 3) Charsets.UTF_8 else Charsets.ISO_8859_1)
-        }
-        return (parts.getOrNull(0) ?: "") to (parts.getOrNull(1) ?: "")
-    }
-
-    private fun splitUtf16(payload: ByteArray): List<String> {
-        val result = mutableListOf<String>()
-        var start = 0
-        var i = 0
-        while (i + 1 < payload.size) {
-            if (payload[i] == 0.toByte() && payload[i + 1] == 0.toByte()) {
-                result += String(payload, start, i - start, Charsets.UTF_16)
-                i += 2
-                start = i
-            } else {
-                i += 2
-            }
-        }
-        if (start < payload.size) result += String(payload, start, payload.size - start, Charsets.UTF_16)
-        return result
-    }
-
-    private fun splitSingleByte(payload: ByteArray, charset: java.nio.charset.Charset): List<String> {
-        val result = mutableListOf<String>()
-        var start = 0
-        for (i in payload.indices) {
-            if (payload[i] == 0.toByte()) {
-                result += String(payload, start, i - start, charset)
-                start = i + 1
-            }
-        }
-        if (start < payload.size) result += String(payload, start, payload.size - start, charset)
-        return result
     }
 
     // --- byte helpers ---

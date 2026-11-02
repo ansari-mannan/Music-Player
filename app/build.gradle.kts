@@ -44,9 +44,23 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        // NewPipeExtractor uses java.time, which only exists from API 26. Desugaring
+        // back-fills it so minSdk can stay at 24.
+        isCoreLibraryDesugaringEnabled = true
     }
     buildFeatures {
         compose = true
+    }
+
+    testOptions {
+        unitTests {
+            // The download and metadata paths log every outcome, and the point of those
+            // paths is that they fail soft. Without this, the stub android.jar throws
+            // from Log.w and the JVM tests fail on the very branches they exist to
+            // prove: "an HTTP failure returns null instead of throwing" would crash in
+            // its own error handler. Nothing here asserts on Android behaviour.
+            isReturnDefaultValues = true
+        }
     }
 }
 
@@ -76,8 +90,24 @@ dependencies {
     // Multi-screen navigation (bottom nav + now playing).
     implementation(libs.androidx.navigation.compose)
 
-    // Thumbnails / image loading.
+    // Thumbnails / image loading. The okhttp fetcher is what lets Coil load remote
+    // URLs (YouTube playlist thumbnails); Coil 3 ships no network stack by default.
     implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
+
+    // YouTube sync: Google Identity authorization, encrypted token storage, HTTP.
+    implementation(libs.play.services.auth)
+    implementation(libs.androidx.security.crypto)
+    implementation(libs.okhttp)
+
+    // Resolves a video id to a real audio stream URL, in pure Java — no Python
+    // runtime, unlike yt-dlp.
+    implementation(libs.newpipe.extractor)
+    coreLibraryDesugaring(libs.desugar.jdk.libs)
+
+    // Periodic background playlist checks. Only the *trigger* — the downloads
+    // themselves need pause/resume, which WorkManager can't express.
+    implementation(libs.androidx.work.runtime.ktx)
 
     // Audio playback + effects (wired up in the playback step).
     implementation(libs.androidx.media3.exoplayer)
@@ -87,6 +117,8 @@ dependencies {
     debugImplementation(libs.androidx.ui.test.manifest)
 
     testImplementation(libs.junit)
+    testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.org.json)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

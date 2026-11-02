@@ -5,7 +5,6 @@ import android.content.Context
 import android.os.Build
 import android.provider.MediaStore
 import com.andres.musicplayer.data.local.entity.Song
-import com.andres.musicplayer.data.local.entity.SongWithTags
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -20,18 +19,15 @@ data class BrowseAudio(
     val folder: String,
     val uri: String,
 ) {
-    /** Transient [SongWithTags] for playback (negative id avoids clashing with library ids). */
-    fun toSongWithTags(): SongWithTags = SongWithTags(
-        song = Song(
-            id = -id,
-            uri = uri,
-            title = title,
-            artist = artist,
-            album = album,
-            durationMs = durationMs,
-            dateAdded = 0,
-        ),
-        tags = emptyList(),
+    /** Transient [Song] for playback (negative id avoids clashing with library ids). */
+    fun toSong(): Song = Song(
+        id = -id,
+        uri = uri,
+        title = title,
+        artist = artist,
+        album = album,
+        durationMs = durationMs,
+        dateAdded = 0,
     )
 }
 

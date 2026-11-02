@@ -5,7 +5,11 @@ import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -54,8 +58,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.andres.musicplayer.R
+import androidx.navigation.NavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -66,12 +72,13 @@ import androidx.navigation.navArgument
 import com.andres.musicplayer.data.prefs.FolderPreferences
 import com.andres.musicplayer.data.prefs.SettingsState
 import com.andres.musicplayer.data.scan.MediaScanner
+import com.andres.musicplayer.data.youtube.PlaylistSync
 import com.andres.musicplayer.domain.ScanLibraryUseCase
+import com.andres.musicplayer.ui.art.ArtworkVersion
 import com.andres.musicplayer.ui.audio.AudioScreen
 import com.andres.musicplayer.ui.browse.BrowseScreen
 import com.andres.musicplayer.App
 import com.andres.musicplayer.ui.eq.EqualizerScreen
-import com.andres.musicplayer.ui.mix.MixScreen
 import com.andres.musicplayer.ui.player.MiniPlayer
 import com.andres.musicplayer.ui.player.NowPlayingScreen
 import com.andres.musicplayer.ui.player.rememberPlayerState
@@ -79,9 +86,11 @@ import com.andres.musicplayer.ui.playlists.PlaylistDetailScreen
 import com.andres.musicplayer.ui.playlists.PlaylistsScreen
 import com.andres.musicplayer.ui.settings.SettingsScreen
 import com.andres.musicplayer.ui.songs.SongsByAlbumScreen
+import com.andres.musicplayer.ui.downloads.DownloadsScreen
+import com.andres.musicplayer.ui.downloads.rememberDownloadsState
 import com.andres.musicplayer.ui.songs.SongsByArtistScreen
-import com.andres.musicplayer.ui.songs.SongsByMoodScreen
-import com.andres.musicplayer.ui.tagging.TagUntaggedSheet
+import com.andres.musicplayer.ui.youtube.SyncedPlaylistsScreen
+import com.andres.musicplayer.ui.youtube.rememberYouTubeSyncState
 import kotlinx.coroutines.launch
 
 /**
@@ -103,6 +112,7 @@ fun AppRoot(settings: SettingsState) {
     val snackbarHostState = remember { SnackbarHostState() }
     val navController = rememberNavController()
     val player = rememberPlayerState()
+    val youtube = rememberYouTubeSyncState()
 
     var folderUri by remember { mutableStateOf(folderPrefs.watchedFolderUri) }
     var isScanning by remember { mutableStateOf(false) }
@@ -115,20 +125,6 @@ fun AppRoot(settings: SettingsState) {
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
-
-    val folderPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree(),
-    ) { uri ->
-        if (uri != null) {
-            context.contentResolver.takePersistableUriPermission(
-                uri,
-                // Write too, so we can save edited info / moods back into the MP3 files.
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
-            folderPrefs.watchedFolderUri = uri.toString()
-            folderUri = uri.toString()
         }
     }
 
@@ -150,7 +146,7 @@ fun AppRoot(settings: SettingsState) {
                             base
                         }
                     }
-                    summary.totalFound == 0 -> "No MP3 files found in that folder."
+                    summary.totalFound == 0 -> "No audio files found in that folder."
                     else -> "No new songs — library is up to date."
                 }
             } catch (e: Exception) {
@@ -160,6 +156,22 @@ fun AppRoot(settings: SettingsState) {
                 scanProgress = null
             }
             snackbarHostState.showSnackbar(message)
+        }
+    }
+
+    val folderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri != null) {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                // Write too, so we can save edited song info back into the MP3 files.
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            folderPrefs.watchedFolderUri = uri.toString()
+            folderUri = uri.toString()
+            // Picking a folder immediately scans it — no separate manual scan needed.
+            runScan()
         }
     }
 
@@ -173,10 +185,39 @@ fun AppRoot(settings: SettingsState) {
         }
     }
 
-    fun syncTagsToFiles() {
+    // The guaranteed sync trigger: every time the app comes to the foreground, check the
+    // watched playlists. Anything new is queued and starts downloading immediately,
+    // because the app being open is exactly when starting a foreground service is
+    // allowed. PlaylistSync itself rate-limits this so app-switching doesn't hammer it.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START) {
+                scope.launch {
+                    app.playlistSync.syncIfDue(PlaylistSync.APP_OPEN_GAP_MS)
+                    // This trigger writes the timestamp straight to SyncPreferences, so
+                    // the Downloads tab's card has to be told, or it shows the age of a
+                    // sync from two launches ago.
+                    youtube.refreshLastSync()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    fun syncMetadataToFiles() {
         scope.launch {
-            val written = repo.syncAllTagsToFiles()
-            snackbarHostState.showSnackbar("Saved tags into $written files.")
+            val result = repo.syncAllMetadataToFiles()
+            // Opus/WebM/FLAC have no tag writer here, so say so rather than quietly
+            // reporting a smaller number than the library size.
+            val message = if (result.skipped > 0) {
+                "Saved song info into ${result.written} files. " +
+                    "${result.skipped} skipped (unsupported format or read-only)."
+            } else {
+                "Saved song info into ${result.written} files."
+            }
+            snackbarHostState.showSnackbar(message)
         }
     }
 
@@ -189,28 +230,24 @@ fun AppRoot(settings: SettingsState) {
         }
     }
 
-    // Untagged-songs tagging flow: prompt once on startup, re-openable from Settings.
-    val songsForTagging by repo.allSongsWithTags.collectAsState(initial = null)
-    val untaggedCount = songsForTagging?.count { it.tags.isEmpty() } ?: 0
-    var taggingPrompted by remember { mutableStateOf(false) }
-    var showTagPrompt by remember { mutableStateOf(false) }
-    var showTagFlow by remember { mutableStateOf(false) }
-    LaunchedEffect(songsForTagging) {
-        val list = songsForTagging
-        if (list != null && !taggingPrompted) {
-            taggingPrompted = true
-            if (list.any { it.tags.isEmpty() }) showTagPrompt = true
+    // Same for YouTube connection / playlist-refresh failures, which can be raised
+    // from either Settings or the picker screen.
+    LaunchedEffect(youtube.error) {
+        val err = youtube.error
+        if (err != null) {
+            snackbarHostState.showSnackbar(err)
+            youtube.clearError()
         }
     }
 
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val isNowPlaying = currentRoute == Routes.NOW_PLAYING
-    val isDetail = currentRoute == Routes.MOOD_SONGS ||
-        currentRoute == Routes.ARTIST_SONGS ||
+    val isDetail = currentRoute == Routes.ARTIST_SONGS ||
         currentRoute == Routes.ALBUM_SONGS ||
         currentRoute == Routes.PLAYLIST_DETAIL ||
-        currentRoute == Routes.EQUALIZER
+        currentRoute == Routes.EQUALIZER ||
+        currentRoute == Routes.SYNCED_PLAYLISTS
 
     Scaffold(
         topBar = {
@@ -243,17 +280,17 @@ fun AppRoot(settings: SettingsState) {
                         MiniPlayer(
                             player = player,
                             onClick = { navController.navigate(Routes.NOW_PLAYING) },
+                            onDismiss = {
+                                // Same as swiping the media notification away: stop playback
+                                // and clear it (the notification + mini-player disappear). The
+                                // app itself stays open.
+                                player.stopAndClear()
+                            },
                         )
                     }
                     AppBottomBar(
                         currentRoute = currentRoute,
                         navController = navController,
-                        onGenerateMix = {
-                            navController.navigate(Routes.MIX) {
-                                popUpTo(navController.graph.findStartDestination().id)
-                                launchSingleTop = true
-                            }
-                        },
                     )
                 }
             }
@@ -271,7 +308,6 @@ fun AppRoot(settings: SettingsState) {
                     player = player,
                     folderUri = folderUri,
                     onPickFolder = { folderPicker.launch(null) },
-                    onMoodClick = { tagId -> navController.navigate(Routes.moodSongs(tagId)) },
                     onArtistClick = { name ->
                         navController.navigate(Routes.artistSongs(Uri.encode(name)))
                     },
@@ -279,17 +315,9 @@ fun AppRoot(settings: SettingsState) {
                         navController.navigate(Routes.albumSongs(Uri.encode(name)))
                     },
                     onOpenPlaylist = { id -> navController.navigate(Routes.playlistDetail(id)) },
-                    onOpenNowPlaying = { navController.navigate(Routes.NOW_PLAYING) },
                 )
             }
             composable(Routes.BROWSE) { BrowseScreen(player = player, repo = repo) }
-            composable(Routes.MIX) {
-                MixScreen(
-                    repo = repo,
-                    player = player,
-                    onOpenNowPlaying = { navController.navigate(Routes.NOW_PLAYING) },
-                )
-            }
             composable(Routes.PLAYLISTS) {
                 PlaylistsScreen(
                     repo = repo,
@@ -300,21 +328,25 @@ fun AppRoot(settings: SettingsState) {
                 SettingsScreen(
                     settings = settings,
                     folderUri = folderUri,
+                    youtube = youtube,
                     onPickFolder = { folderPicker.launch(null) },
                     onScan = { runScan() },
                     onOpenEqualizer = { navController.navigate(Routes.EQUALIZER) },
-                    untaggedCount = untaggedCount,
-                    onTagUntagged = { showTagFlow = true },
-                    onSyncTags = { syncTagsToFiles() },
+                    onSyncMetadata = { syncMetadataToFiles() },
+                    onManageSyncedPlaylists = {
+                        navController.navigate(Routes.SYNCED_PLAYLISTS)
+                    },
+                    onOpenDownloads = { navController.switchTab(Routes.DOWNLOADS) },
                 )
             }
             composable(Routes.EQUALIZER) { EqualizerScreen() }
-            composable(
-                route = Routes.MOOD_SONGS,
-                arguments = listOf(navArgument("tagId") { type = NavType.LongType }),
-            ) { entry ->
-                val tagId = entry.arguments?.getLong("tagId") ?: 0L
-                SongsByMoodScreen(repo = repo, player = player, tagId = tagId)
+            composable(Routes.SYNCED_PLAYLISTS) { SyncedPlaylistsScreen(youtube = youtube) }
+            composable(Routes.DOWNLOADS) {
+                DownloadsScreen(
+                    downloads = rememberDownloadsState(),
+                    youtube = youtube,
+                    onManagePlaylists = { navController.navigate(Routes.SYNCED_PLAYLISTS) },
+                )
             }
             composable(
                 route = Routes.ARTIST_SONGS,
@@ -347,35 +379,16 @@ fun AppRoot(settings: SettingsState) {
                             repo.writeMetadataToFile(id)
                         }
                     },
+                    onChangeArtwork = { id, imageUri ->
+                        scope.launch {
+                            if (repo.writeArtworkFromUri(id, imageUri)) ArtworkVersion.bump()
+                        }
+                    },
                 )
             }
         }
     }
 
-    if (showTagPrompt) {
-        AlertDialog(
-            onDismissRequest = { showTagPrompt = false },
-            title = { Text("Tag your songs?") },
-            text = {
-                Text(
-                    "You have $untaggedCount untagged " +
-                        (if (untaggedCount == 1) "song" else "songs") +
-                        ". Add moods now so you can build mixes and browse by vibe. " +
-                        "You can stop anytime and finish later.",
-                )
-            },
-            confirmButton = {
-                Button(onClick = { showTagPrompt = false; showTagFlow = true }) { Text("Tag now") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showTagPrompt = false }) { Text("Maybe later") }
-            },
-        )
-    }
-
-    if (showTagFlow) {
-        TagUntaggedSheet(repo = repo, onDismiss = { showTagFlow = false })
-    }
 }
 
 /** Persistent header: logo space + app name, with optional back and scan actions. */
@@ -425,24 +438,20 @@ private fun AppHeader(
 @Composable
 private fun AppBottomBar(
     currentRoute: String?,
-    navController: androidx.navigation.NavController,
-    onGenerateMix: () -> Unit,
+    navController: NavController,
 ) {
-    val selected = bottomSelectedRoute(currentRoute)
+    val selected = bottomSelectedRoute(
+        currentRoute,
+        navController.previousBackStackEntry?.destination?.route,
+    )
 
     fun navTo(route: String) {
-        if (selected != route) {
-            navController.navigate(route) {
-                popUpTo(navController.graph.findStartDestination().id)
-                launchSingleTop = true
-            }
-        }
+        if (selected != route) navController.switchTab(route)
     }
 
-    // Bar with the four destinations split around a central slot, plus a raised
-    // circular "Generate mix" button that reads as the app's primary action.
-    // One Row, five equal cells, all vertically centered on the same line. The
-    // center cell holds the circular "Generate mix" button.
+    // One Row of equal cells, all vertically centered on the same line. (The center slot
+    // used to hold a raised "Generate mix" button; mood mixing is gone, so the
+    // destinations simply divide the width evenly.)
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainer,
         tonalElevation = 2.dp,
@@ -454,29 +463,7 @@ private fun AppBottomBar(
                 .height(72.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            NavCell(bottomDestinations[0], selected, ::navTo) // Audio
-            NavCell(bottomDestinations[1], selected, ::navTo) // Browse
-
-            Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                Surface(
-                    onClick = onGenerateMix,
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary,
-                    modifier = Modifier.size(46.dp),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Default.AutoAwesome,
-                            contentDescription = "Generate mix",
-                            modifier = Modifier.size(24.dp),
-                        )
-                    }
-                }
-            }
-
-            NavCell(bottomDestinations[2], selected, ::navTo) // Playlists
-            NavCell(bottomDestinations[3], selected, ::navTo) // Settings
+            bottomDestinations.forEach { dest -> NavCell(dest, selected, ::navTo) }
         }
     }
 }
@@ -508,15 +495,46 @@ private fun RowScope.NavCell(
             modifier = Modifier.size(22.dp),
         )
         Spacer(Modifier.height(2.dp))
-        Text(dest.label, style = MaterialTheme.typography.labelSmall, color = color)
+        // Five cells leave roughly 70dp each on a normal phone, which "Downloads" and
+        // "Playlists" both fit. Pinned to one line so a large system font size clips a
+        // label rather than reflowing it onto two rows and unbalancing the bar.
+        Text(
+            text = dest.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 2.dp),
+        )
     }
 }
 
-/** Maps detail routes back to the bottom tab they belong under. */
-private fun bottomSelectedRoute(currentRoute: String?): String = when (currentRoute) {
-    Routes.MOOD_SONGS, Routes.ARTIST_SONGS, Routes.ALBUM_SONGS, Routes.NOW_PLAYING -> Routes.AUDIO
-    Routes.EQUALIZER -> Routes.SETTINGS
-    Routes.PLAYLIST_DETAIL -> Routes.PLAYLISTS
-    null -> Routes.PLAYLISTS
-    else -> currentRoute
+/**
+ * Maps detail routes back to the bottom tab they belong under.
+ *
+ * The playlist picker is the one route with two ways in — Settings, and the Downloads
+ * tab's sync card — so it keeps whichever tab actually opened it lit rather than always
+ * claiming to be under Settings and making the bar jump on the way in.
+ */
+internal fun bottomSelectedRoute(currentRoute: String?, previousRoute: String?): String =
+    when (currentRoute) {
+        Routes.ARTIST_SONGS, Routes.ALBUM_SONGS, Routes.NOW_PLAYING -> Routes.AUDIO
+        Routes.EQUALIZER -> Routes.SETTINGS
+        Routes.SYNCED_PLAYLISTS ->
+            previousRoute?.takeIf { it == Routes.DOWNLOADS } ?: Routes.SETTINGS
+        Routes.PLAYLIST_DETAIL -> Routes.PLAYLISTS
+        null -> Routes.PLAYLISTS
+        else -> currentRoute
+    }
+
+/**
+ * Switches bottom-nav tabs. Shared with the shortcut in Settings so that arriving at
+ * Downloads from there behaves identically to tapping its tab — one entry on the back
+ * stack, not a Settings → Downloads pair that Back has to walk out of.
+ */
+private fun NavController.switchTab(route: String) {
+    navigate(route) {
+        popUpTo(graph.findStartDestination().id)
+        launchSingleTop = true
+    }
 }

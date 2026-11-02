@@ -54,193 +54,36 @@ fun AndresMusicPlayerTheme(
 /**
  * The light-mode [ColorScheme] for a given accent.
  *
- * Full-palette custom themes (see [explicitScheme]) supply every visually relevant
- * role explicitly. The simple accents go through [seedScheme], which derives a whole
- * consistent palette from the one seed colour — crucially it also tints
- * primaryContainer / secondary / tertiary, so accent-coloured surfaces (the logo
- * chip, the new-playlist / new-mood FABs) actually track the chosen accent instead
- * of keeping Material's default purple container.
+ * The user only likes the Candy Pastel look, so every theme/accent now shares that
+ * soft pastel feel: pale tinted backgrounds, white surfaces, gentle pastel primaries
+ * and light tinted containers. Each theme keeps its own hue (from its seed) so they
+ * stay distinguishable, but they're all "candy pastel"-styled. Candy Pastel itself
+ * keeps its hand-tuned reference palette.
  */
 fun lightSchemeFor(accent: AccentColor): ColorScheme = when (accent) {
-    AccentColor.CURRENTS -> explicitScheme(
-        CurrentsLightPrimary, CurrentsLightOnPrimary,
-        CurrentsLightPrimaryContainer, CurrentsLightOnPrimaryContainer,
-        CurrentsLightBackground, CurrentsLightSurface,
-        CurrentsLightOnBackground, CurrentsLightOnSurface,
-    )
-    AccentColor.IN_RAINBOWS -> explicitScheme(
-        InRainbowsLightPrimary, InRainbowsLightOnPrimary,
-        InRainbowsLightPrimaryContainer, InRainbowsLightOnPrimaryContainer,
-        InRainbowsLightBackground, InRainbowsLightSurface,
-        InRainbowsLightOnBackground, InRainbowsLightOnSurface,
-    )
-    AccentColor.TRUE_BLACK -> explicitScheme(
-        TrueBlackLightPrimary, TrueBlackLightOnPrimary,
-        TrueBlackLightPrimaryContainer, TrueBlackLightOnPrimaryContainer,
-        TrueBlackLightBackground, TrueBlackLightSurface,
-        TrueBlackLightOnBackground, TrueBlackLightOnSurface,
-    )
-    AccentColor.MONOCHROME -> explicitScheme(
-        MonochromeLightPrimary, MonochromeLightOnPrimary,
-        MonochromeLightPrimaryContainer, MonochromeLightOnPrimaryContainer,
-        MonochromeLightBackground, MonochromeLightSurface,
-        MonochromeLightOnBackground, MonochromeLightOnSurface,
-    )
-    AccentColor.COLD_SLATE -> explicitScheme(
-        ColdSlateLightPrimary, ColdSlateLightOnPrimary,
-        ColdSlateLightPrimaryContainer, ColdSlateLightOnPrimaryContainer,
-        ColdSlateLightBackground, ColdSlateLightSurface,
-        ColdSlateLightOnBackground, ColdSlateLightOnSurface,
-    )
-    AccentColor.MOSS_STONE -> explicitScheme(
-        MossStoneLightPrimary, MossStoneLightOnPrimary,
-        MossStoneLightPrimaryContainer, MossStoneLightOnPrimaryContainer,
-        MossStoneLightBackground, MossStoneLightSurface,
-        MossStoneLightOnBackground, MossStoneLightOnSurface,
-    )
-    AccentColor.INK_RUST -> explicitScheme(
-        InkRustLightPrimary, InkRustLightOnPrimary,
-        InkRustLightPrimaryContainer, InkRustLightOnPrimaryContainer,
-        InkRustLightBackground, InkRustLightSurface,
-        InkRustLightOnBackground, InkRustLightOnSurface,
-    )
-    AccentColor.DEEP_VIOLET -> explicitScheme(
-        DeepVioletLightPrimary, DeepVioletLightOnPrimary,
-        DeepVioletLightPrimaryContainer, DeepVioletLightOnPrimaryContainer,
-        DeepVioletLightBackground, DeepVioletLightSurface,
-        DeepVioletLightOnBackground, DeepVioletLightOnSurface,
-    )
-    AccentColor.BLEACHED_SAND -> explicitScheme(
-        BleachedSandLightPrimary, BleachedSandLightOnPrimary,
-        BleachedSandLightPrimaryContainer, BleachedSandLightOnPrimaryContainer,
-        BleachedSandLightBackground, BleachedSandLightSurface,
-        BleachedSandLightOnBackground, BleachedSandLightOnSurface,
-    )
-    AccentColor.ACID_TERMINAL -> explicitScheme(
-        AcidTerminalLightPrimary, AcidTerminalLightOnPrimary,
-        AcidTerminalLightPrimaryContainer, AcidTerminalLightOnPrimaryContainer,
-        AcidTerminalLightBackground, AcidTerminalLightSurface,
-        AcidTerminalLightOnBackground, AcidTerminalLightOnSurface,
-    )
-    AccentColor.VAPORWAVE -> explicitScheme(
-        VaporwaveLightPrimary, VaporwaveLightOnPrimary,
-        VaporwaveLightPrimaryContainer, VaporwaveLightOnPrimaryContainer,
-        VaporwaveLightBackground, VaporwaveLightSurface,
-        VaporwaveLightOnBackground, VaporwaveLightOnSurface,
-    )
-    AccentColor.BLUEPRINT -> explicitScheme(
-        BlueprintLightPrimary, BlueprintLightOnPrimary,
-        BlueprintLightPrimaryContainer, BlueprintLightOnPrimaryContainer,
-        BlueprintLightBackground, BlueprintLightSurface,
-        BlueprintLightOnBackground, BlueprintLightOnSurface,
-    )
     AccentColor.CANDY_PASTEL -> explicitScheme(
         CandyPastelLightPrimary, CandyPastelLightOnPrimary,
         CandyPastelLightPrimaryContainer, CandyPastelLightOnPrimaryContainer,
         CandyPastelLightBackground, CandyPastelLightSurface,
         CandyPastelLightOnBackground, CandyPastelLightOnSurface,
     )
-    AccentColor.RADIOACTIVE_AMBER -> explicitScheme(
-        RadioactiveAmberLightPrimary, RadioactiveAmberLightOnPrimary,
-        RadioactiveAmberLightPrimaryContainer, RadioactiveAmberLightOnPrimaryContainer,
-        RadioactiveAmberLightBackground, RadioactiveAmberLightSurface,
-        RadioactiveAmberLightOnBackground, RadioactiveAmberLightOnSurface,
-    )
-    // Every simple seed-based accent: derive a full light palette from its seed.
-    else -> seedScheme(Color(accent.seed), dark = false)
+    // Every other accent/theme: a candy-pastel palette tinted by its own seed hue.
+    else -> pastelScheme(Color(accent.seed), dark = false)
 }
 
 /**
- * The dark-mode [ColorScheme] for a given accent. Mirrors [lightSchemeFor]: custom
- * themes return their explicit dark palette, all other accents derive from one seed.
+ * The dark-mode [ColorScheme] for a given accent. Mirrors [lightSchemeFor]: Candy
+ * Pastel keeps its explicit dark palette, everything else gets a pastel palette
+ * derived from its seed hue.
  */
 fun darkSchemeFor(accent: AccentColor): ColorScheme = when (accent) {
-    AccentColor.CURRENTS -> explicitScheme(
-        CurrentsDarkPrimary, CurrentsDarkOnPrimary,
-        CurrentsDarkPrimaryContainer, CurrentsDarkOnPrimaryContainer,
-        CurrentsDarkBackground, CurrentsDarkSurface,
-        CurrentsDarkOnBackground, CurrentsDarkOnSurface,
-    )
-    AccentColor.IN_RAINBOWS -> explicitScheme(
-        InRainbowsDarkPrimary, InRainbowsDarkOnPrimary,
-        InRainbowsDarkPrimaryContainer, InRainbowsDarkOnPrimaryContainer,
-        InRainbowsDarkBackground, InRainbowsDarkSurface,
-        InRainbowsDarkOnBackground, InRainbowsDarkOnSurface,
-    )
-    AccentColor.TRUE_BLACK -> explicitScheme(
-        TrueBlackDarkPrimary, TrueBlackDarkOnPrimary,
-        TrueBlackDarkPrimaryContainer, TrueBlackDarkOnPrimaryContainer,
-        TrueBlackDarkBackground, TrueBlackDarkSurface,
-        TrueBlackDarkOnBackground, TrueBlackDarkOnSurface,
-    )
-    AccentColor.MONOCHROME -> explicitScheme(
-        MonochromeDarkPrimary, MonochromeDarkOnPrimary,
-        MonochromeDarkPrimaryContainer, MonochromeDarkOnPrimaryContainer,
-        MonochromeDarkBackground, MonochromeDarkSurface,
-        MonochromeDarkOnBackground, MonochromeDarkOnSurface,
-    )
-    AccentColor.COLD_SLATE -> explicitScheme(
-        ColdSlateDarkPrimary, ColdSlateDarkOnPrimary,
-        ColdSlateDarkPrimaryContainer, ColdSlateDarkOnPrimaryContainer,
-        ColdSlateDarkBackground, ColdSlateDarkSurface,
-        ColdSlateDarkOnBackground, ColdSlateDarkOnSurface,
-    )
-    AccentColor.MOSS_STONE -> explicitScheme(
-        MossStoneDarkPrimary, MossStoneDarkOnPrimary,
-        MossStoneDarkPrimaryContainer, MossStoneDarkOnPrimaryContainer,
-        MossStoneDarkBackground, MossStoneDarkSurface,
-        MossStoneDarkOnBackground, MossStoneDarkOnSurface,
-    )
-    AccentColor.INK_RUST -> explicitScheme(
-        InkRustDarkPrimary, InkRustDarkOnPrimary,
-        InkRustDarkPrimaryContainer, InkRustDarkOnPrimaryContainer,
-        InkRustDarkBackground, InkRustDarkSurface,
-        InkRustDarkOnBackground, InkRustDarkOnSurface,
-    )
-    AccentColor.DEEP_VIOLET -> explicitScheme(
-        DeepVioletDarkPrimary, DeepVioletDarkOnPrimary,
-        DeepVioletDarkPrimaryContainer, DeepVioletDarkOnPrimaryContainer,
-        DeepVioletDarkBackground, DeepVioletDarkSurface,
-        DeepVioletDarkOnBackground, DeepVioletDarkOnSurface,
-    )
-    AccentColor.BLEACHED_SAND -> explicitScheme(
-        BleachedSandDarkPrimary, BleachedSandDarkOnPrimary,
-        BleachedSandDarkPrimaryContainer, BleachedSandDarkOnPrimaryContainer,
-        BleachedSandDarkBackground, BleachedSandDarkSurface,
-        BleachedSandDarkOnBackground, BleachedSandDarkOnSurface,
-    )
-    AccentColor.ACID_TERMINAL -> explicitScheme(
-        AcidTerminalDarkPrimary, AcidTerminalDarkOnPrimary,
-        AcidTerminalDarkPrimaryContainer, AcidTerminalDarkOnPrimaryContainer,
-        AcidTerminalDarkBackground, AcidTerminalDarkSurface,
-        AcidTerminalDarkOnBackground, AcidTerminalDarkOnSurface,
-    )
-    AccentColor.VAPORWAVE -> explicitScheme(
-        VaporwaveDarkPrimary, VaporwaveDarkOnPrimary,
-        VaporwaveDarkPrimaryContainer, VaporwaveDarkOnPrimaryContainer,
-        VaporwaveDarkBackground, VaporwaveDarkSurface,
-        VaporwaveDarkOnBackground, VaporwaveDarkOnSurface,
-    )
-    AccentColor.BLUEPRINT -> explicitScheme(
-        BlueprintDarkPrimary, BlueprintDarkOnPrimary,
-        BlueprintDarkPrimaryContainer, BlueprintDarkOnPrimaryContainer,
-        BlueprintDarkBackground, BlueprintDarkSurface,
-        BlueprintDarkOnBackground, BlueprintDarkOnSurface,
-    )
     AccentColor.CANDY_PASTEL -> explicitScheme(
         CandyPastelDarkPrimary, CandyPastelDarkOnPrimary,
         CandyPastelDarkPrimaryContainer, CandyPastelDarkOnPrimaryContainer,
         CandyPastelDarkBackground, CandyPastelDarkSurface,
         CandyPastelDarkOnBackground, CandyPastelDarkOnSurface,
     )
-    AccentColor.RADIOACTIVE_AMBER -> explicitScheme(
-        RadioactiveAmberDarkPrimary, RadioactiveAmberDarkOnPrimary,
-        RadioactiveAmberDarkPrimaryContainer, RadioactiveAmberDarkOnPrimaryContainer,
-        RadioactiveAmberDarkBackground, RadioactiveAmberDarkSurface,
-        RadioactiveAmberDarkOnBackground, RadioactiveAmberDarkOnSurface,
-    )
-    // Every simple seed-based accent: derive a full dark palette from its seed.
-    else -> seedScheme(Color(accent.seed), dark = true)
+    else -> pastelScheme(Color(accent.seed), dark = true)
 }
 
 /**
@@ -309,32 +152,33 @@ private fun explicitScheme(
 }
 
 /**
- * Derives a full palette from a single seed colour for the simple accents. Starts
- * from Material's neutral light/dark scheme (keeping its clean white/near-black
- * surfaces) but recolours primary AND primaryContainer / secondary / tertiary from
- * the seed — so the seed actually shows up on accent-coloured surfaces, not just on
- * the few components that read `primary`.
+ * Builds a candy-pastel [ColorScheme] from a single seed hue. The seed is softened
+ * toward white (pastel primary) and used to faintly tint the background/containers,
+ * so every theme reads as the same gentle pastel style while keeping its own colour.
+ * Reuses [explicitScheme] to fill in the full surface/outline family consistently.
  */
-private fun seedScheme(seed: Color, dark: Boolean): ColorScheme {
-    val base = if (dark) darkColorScheme() else lightColorScheme()
-    val onPrimary = if (seed.luminance() > 0.5f) Color.Black else Color.White
-    val container = if (dark) lerp(seed, base.surface, 0.74f) else lerp(seed, Color.White, 0.82f)
-    val onContainer = if (dark) lerp(seed, Color.White, 0.70f) else lerp(seed, Color.Black, 0.55f)
-
-    return base.copy(
-        primary = seed,
-        onPrimary = onPrimary,
-        primaryContainer = container,
-        onPrimaryContainer = onContainer,
-        inversePrimary = container,
-        secondary = seed,
-        onSecondary = onPrimary,
-        secondaryContainer = container,
-        onSecondaryContainer = onContainer,
-        tertiary = seed,
-        onTertiary = onPrimary,
-        tertiaryContainer = container,
-        onTertiaryContainer = onContainer,
-        surfaceTint = seed,
+private fun pastelScheme(seed: Color, dark: Boolean): ColorScheme = if (dark) {
+    val primary = lerp(seed, Color.White, 0.32f)
+    explicitScheme(
+        primary = primary,
+        onPrimary = if (primary.luminance() > 0.5f) Color.Black else Color.White,
+        primaryContainer = lerp(seed, Color.Black, 0.62f),
+        onPrimaryContainer = lerp(seed, Color.White, 0.62f),
+        background = lerp(seed, Color.Black, 0.86f),
+        surface = lerp(seed, Color.Black, 0.80f),
+        onBackground = lerp(seed, Color.White, 0.86f),
+        onSurface = lerp(seed, Color.White, 0.86f),
+    )
+} else {
+    val primary = lerp(seed, Color.White, 0.30f)
+    explicitScheme(
+        primary = primary,
+        onPrimary = if (primary.luminance() > 0.5f) lerp(seed, Color.Black, 0.55f) else Color.White,
+        primaryContainer = lerp(seed, Color.White, 0.80f),
+        onPrimaryContainer = lerp(seed, Color.Black, 0.50f),
+        background = lerp(seed, Color.White, 0.92f),
+        surface = Color.White,
+        onBackground = lerp(seed, Color.Black, 0.68f),
+        onSurface = lerp(seed, Color.Black, 0.68f),
     )
 }

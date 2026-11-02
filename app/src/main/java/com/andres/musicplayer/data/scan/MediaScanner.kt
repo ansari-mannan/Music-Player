@@ -4,34 +4,37 @@ import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
-import com.andres.musicplayer.data.id3.Id3Tag
 import com.andres.musicplayer.data.local.entity.Song
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Reads MP3 files out of a user-picked SAF folder tree and turns them into
+ * Reads audio files out of a user-picked SAF folder tree and turns them into
  * [Song]s. Does no database work itself — it just discovers and reads files.
+ *
+ * Not MP3-only: YouTube never serves MP3, so anything downloaded in-app arrives as
+ * m4a (AAC) or, occasionally, webm/Opus. Media3 plays all of them natively, so the
+ * scanner accepts them rather than the app transcoding — re-encoding lossy audio to
+ * lossy MP3 would need a bundled encoder Android doesn't ship, and would sound worse.
  */
 class MediaScanner(private val context: Context) {
 
-    /** A newly-discovered song plus its source subfolder and any moods saved in the file. */
+    /** A newly-discovered song plus the source subfolder it was found in. */
     data class ScannedSong(
         val song: Song,
         val sourceSubfolder: String?,
-        val moods: List<String>,
     )
 
     data class Result(
         val newSongs: List<ScannedSong>,
-        val totalMp3Found: Int,
-        /** Every MP3 uri found in the tree (used to detect deleted/orphaned files). */
+        val totalAudioFound: Int,
+        /** Every audio uri found in the tree (used to detect deleted/orphaned files). */
         val allFoundUris: List<String>,
     )
 
     /**
      * Walks [treeUri] (recursively, including subfolders), reads metadata from
-     * every .mp3 that isn't already in [knownUris], and returns the new songs.
+     * every audio file that isn't already in [knownUris], and returns the new songs.
      * Reports progress through [onProgress] as files are processed. Runs on the
      * IO dispatcher because file/metadata access is blocking.
      */
@@ -42,50 +45,83 @@ class MediaScanner(private val context: Context) {
     ): Result =
         withContext(Dispatchers.IO) {
             val root = DocumentFile.fromTreeUri(context, treeUri)
-                ?: return@withContext Result(emptyList(), totalMp3Found = 0, allFoundUris = emptyList())
+                ?: return@withContext Result(emptyList(), totalAudioFound = 0, allFoundUris = emptyList())
 
-            val mp3Files = mutableListOf<FoundFile>()
+            val audioFiles = mutableListOf<FoundFile>()
             // Start at the root with no subfolder; it's set once when descending one level.
-            collectMp3Files(root, subfolder = null, out = mp3Files)
+            collectAudioFiles(root, subfolder = null, out = audioFiles)
 
-            val total = mp3Files.size
+            val total = audioFiles.size
             onProgress(0, total)
 
             val allFoundUris = ArrayList<String>(total)
             val newSongs = mutableListOf<ScannedSong>()
-            mp3Files.forEachIndexed { index, found ->
+            audioFiles.forEachIndexed { index, found ->
                 val uriString = found.file.uri.toString()
-                allFoundUris += uriString
-                if (uriString !in knownUris) {
-                    val moods = Id3Tag.readMoods(context, uriString)
-                    newSongs += ScannedSong(readSong(found.file), found.subfolder, moods)
+                if (uriString in knownUris) {
+                    allFoundUris += uriString
+                } else {
+                    // Null means it turned out to be video (an .mp4/.webm that isn't
+                    // audio) or unreadable — leave it out of the library entirely, and
+                    // out of allFoundUris so it isn't mistaken for a live song.
+                    val song = readSong(found.file)
+                    if (song != null) {
+                        allFoundUris += uriString
+                        newSongs += ScannedSong(song, found.subfolder)
+                    }
                 }
                 onProgress(index + 1, total)
             }
 
-            Result(newSongs = newSongs, totalMp3Found = total, allFoundUris = allFoundUris)
+            Result(
+                newSongs = newSongs,
+                totalAudioFound = allFoundUris.size,
+                allFoundUris = allFoundUris,
+            )
         }
 
     /** A discovered file paired with the root subfolder it lives under (null = loose in root). */
     private data class FoundFile(val file: DocumentFile, val subfolder: String?)
 
-    private fun collectMp3Files(dir: DocumentFile, subfolder: String?, out: MutableList<FoundFile>) {
+    private fun collectAudioFiles(dir: DocumentFile, subfolder: String?, out: MutableList<FoundFile>) {
         for (child in dir.listFiles()) {
             when {
                 // First descent from root sets the subfolder; deeper levels keep it.
-                child.isDirectory -> collectMp3Files(child, subfolder ?: child.name, out)
-                isMp3(child) -> out += FoundFile(child, subfolder)
+                child.isDirectory -> collectAudioFiles(child, subfolder ?: child.name, out)
+                isSupportedAudio(child) -> out += FoundFile(child, subfolder)
             }
         }
     }
 
-    private fun isMp3(file: DocumentFile): Boolean {
+    private fun isSupportedAudio(file: DocumentFile): Boolean {
         if (!file.isFile) return false
         val name = file.name?.lowercase().orEmpty()
-        return name.endsWith(".mp3") || file.type == "audio/mpeg"
+        val extension = name.substringAfterLast('.', "")
+        return extension in AUDIO_EXTENSIONS || file.type in AUDIO_MIME_TYPES
     }
 
-    private fun readSong(file: DocumentFile): Song {
+    private companion object {
+        /**
+         * `.mp4` and `.webm` are container extensions that can hold video too — a video
+         * file dropped in the music folder would be picked up here, but [readSong]
+         * discards anything with a video track, so it never reaches the library.
+         */
+        val AUDIO_EXTENSIONS = setOf(
+            "mp3", "m4a", "m4b", "mp4", "aac", "opus", "ogg", "oga", "webm", "flac", "wav",
+        )
+
+        val AUDIO_MIME_TYPES = setOf(
+            "audio/mpeg", "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/aac",
+            "audio/ogg", "audio/opus", "audio/webm", "audio/flac", "audio/x-flac",
+            "audio/wav", "audio/x-wav",
+        )
+    }
+
+    /**
+     * Reads one file into a [Song], or returns null if it shouldn't be in the library:
+     * a container that turned out to hold video, or a file that has no audio at all.
+     */
+    private fun readSong(file: DocumentFile): Song? {
         val uri = file.uri
         val displayName = file.name ?: "Unknown"
         val fallbackTitle = displayName.substringBeforeLast(".", displayName)
@@ -93,6 +129,9 @@ class MediaScanner(private val context: Context) {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)
+            val hasVideo = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes"
+            if (hasVideo) return null
             val title = retriever
                 .extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
                 ?.takeIf { it.isNotBlank() }
@@ -116,7 +155,7 @@ class MediaScanner(private val context: Context) {
             )
         } catch (_: Exception) {
             // Unreadable/corrupt file: still record it (by filename) so it shows
-            // up and can be tagged; metadata just stays minimal.
+            // up in the library; metadata just stays minimal.
             Song(uri = uri.toString(), title = fallbackTitle, artist = null, durationMs = 0L)
         } finally {
             retriever.release()

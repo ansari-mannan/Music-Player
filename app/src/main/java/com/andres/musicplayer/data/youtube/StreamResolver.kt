@@ -1,0 +1,233 @@
+package com.andres.musicplayer.data.youtube
+
+import com.andres.musicplayer.data.tags.Mp4Tag
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.schabi.newpipe.extractor.Image
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
+import org.schabi.newpipe.extractor.exceptions.ContentNotSupportedException
+import org.schabi.newpipe.extractor.exceptions.FoundAdException
+import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import org.schabi.newpipe.extractor.exceptions.SignInConfirmNotBotException
+import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.StreamInfo
+import java.io.IOException
+
+/** A playable audio stream for one video, valid only for a few minutes. */
+data class ResolvedStream(
+    val videoId: String,
+    val title: String,
+    val uploader: String?,
+    /** Expiring direct URL. Never persist this — re-resolve before every connection. */
+    val url: String,
+    /** Container suffix as YouTube serves it, e.g. `m4a` or `webm`. */
+    val fileExtension: String,
+    val averageBitrate: Int,
+    /** Content length when the extractor knows it, else null. */
+    val contentLength: Long?,
+    /**
+     * Every cover image YouTube offers, largest first, or empty if it offers none.
+     *
+     * A list rather than a single best pick because the best pick is not always there:
+     * `maxresdefault` is absent for plenty of videos and its URL 404s when it is, and a
+     * track should not end up with no artwork when the next size down would have done.
+     * Unlike [url] these do not expire — they are ordinary static image URLs.
+     */
+    val thumbnailUrls: List<String>,
+)
+
+/**
+ * Why a video couldn't be turned into a stream.
+ *
+ * The distinction that matters to the user is the first one: NewPipeExtractor reads
+ * YouTube's internals, and YouTube changes those internals whenever it likes. When that
+ * happens *every* download starts failing at once, through no fault of anything in this
+ * app and with nothing the user can fix — the library needs a version bump. That must not
+ * look like "no internet" or like a video that was simply taken down, because those have
+ * completely different answers.
+ */
+enum class ResolutionFailure(val userMessage: String) {
+    /** YouTube changed something server-side and the extractor no longer keeps up. */
+    EXTRACTOR_OUT_OF_DATE(
+        "Couldn't read this video — YouTube may have changed something server-side. " +
+            "Try again later or check for an app update.",
+    ),
+
+    /** This particular video is gone or off-limits. Nothing to do with the app. */
+    VIDEO_UNAVAILABLE(
+        "This video isn't available — it may be private, removed, age-restricted, " +
+            "paid, or blocked in your region.",
+    ),
+
+    /** The video is reachable but holds nothing this app can save as an audio file. */
+    NOT_DOWNLOADABLE("This video has no downloadable audio track."),
+
+    /** YouTube is refusing to serve us until a human proves they are one. */
+    BLOCKED_BY_YOUTUBE(
+        "YouTube is asking us to prove we're not a bot. Wait a while and try again.",
+    ),
+
+    /** Never got as far as YouTube. */
+    NETWORK("Couldn't reach YouTube to look this video up."),
+}
+
+/**
+ * A video could not be resolved to a stream. The [failure] is what the user is told;
+ * the extractor's own wording travels in [detail] and the cause chain, for the log.
+ */
+class StreamResolutionException(
+    val failure: ResolutionFailure,
+    val detail: String? = null,
+    cause: Throwable? = null,
+) : IOException(failure.userMessage, cause)
+
+/**
+ * Sorts a throwable out of NewPipeExtractor into something worth telling the user.
+ *
+ * **The order of these checks is the whole point.** `ContentNotAvailableException`
+ * extends `ParsingException`, so testing for a parsing failure first would report every
+ * private or deleted video as "YouTube changed something" and send the user hunting for
+ * an app update that doesn't exist. Specific causes are matched before general ones.
+ *
+ * Anything unrecognised lands on [ResolutionFailure.EXTRACTOR_OUT_OF_DATE], which is the
+ * right default: a stray `NullPointerException` or JSON parse error from deep inside the
+ * extractor is exactly what a server-side change looks like from here.
+ */
+internal fun classifyResolutionFailure(e: Throwable): ResolutionFailure = when (e) {
+    // Reaching YouTube failed outright — checked first, because it says nothing at all
+    // about whether the extractor still understands YouTube.
+    is IOException -> ResolutionFailure.NETWORK
+
+    is ReCaptchaException, is SignInConfirmNotBotException -> ResolutionFailure.BLOCKED_BY_YOUTUBE
+
+    // Every "you can't have this one" case, including the restriction subclasses.
+    is ContentNotAvailableException -> ResolutionFailure.VIDEO_UNAVAILABLE
+
+    is ContentNotSupportedException, is FoundAdException -> ResolutionFailure.NOT_DOWNLOADABLE
+
+    else -> ResolutionFailure.EXTRACTOR_OUT_OF_DATE
+}
+
+/**
+ * The audio stream to download: a taggable container first, bitrate second.
+ *
+ * **The order of those two keys is the whole point.** YouTube offers the same song as AAC
+ * in m4a (itag 140, ~128 kbit/s) and as Opus in webm (itag 251, ~160 kbit/s), and the Opus
+ * one always wins on bitrate. Ranking by bitrate first therefore picked webm for
+ * essentially every video — and nothing in this app can write metadata into a webm, so
+ * every downloaded track arrived with no cover art, no artist and no album, while the
+ * m4a-preferring tiebreak that was supposed to prevent it never once ran.
+ *
+ * A few kbit/s of Opus is not worth a library that can't be browsed. Bitrate still decides
+ * between m4a candidates, and a video that offers no m4a at all still falls back to the
+ * best of whatever it does offer rather than failing.
+ */
+internal fun pickBestAudio(streams: List<AudioStream>?): AudioStream? {
+    if (streams.isNullOrEmpty()) return null
+    return streams
+        .filter { !it.content.isNullOrBlank() }
+        .maxWithOrNull(
+            compareBy<AudioStream> { if (isTaggable(it)) 1 else 0 }
+                .thenBy { it.averageBitrate },
+        )
+}
+
+/** True when the tag writer can put a title, artist, album and cover into this container. */
+private fun isTaggable(stream: AudioStream): Boolean =
+    stream.format?.suffix?.lowercase() in Mp4Tag.EXTENSIONS
+
+/**
+ * Every thumbnail YouTube offers, biggest first, so a caller can fall down the list when
+ * one fails rather than giving up on artwork entirely.
+ *
+ * Size decides the order because a bigger image survives the square crop with more pixels
+ * left; the extractor's own coarse ranking only breaks ties, and only where dimensions
+ * weren't reported at all.
+ */
+internal fun rankThumbnails(images: List<Image>?): List<String> {
+    if (images.isNullOrEmpty()) return emptyList()
+    return images
+        .filter { !it.url.isNullOrBlank() }
+        .sortedWith(
+            compareByDescending<Image> { pixelCount(it) }
+                // HIGH is ordinal 0, so a *smaller* ordinal is the better image.
+                .thenBy { it.estimatedResolutionLevel.ordinal },
+        )
+        .map { it.url }
+        .distinct()
+}
+
+/** -1 for "not reported", which sorts below any image whose size is known. */
+private fun pixelCount(image: Image): Long {
+    val width = image.width
+    val height = image.height
+    return if (width > 0 && height > 0) width.toLong() * height else -1L
+}
+
+/**
+ * Turns a YouTube video id into a direct audio stream URL using NewPipeExtractor.
+ *
+ * NewPipeExtractor rather than yt-dlp: it's pure Java, so there is no Python runtime to
+ * embed. It is also the only part of the app that has to keep up with YouTube's player
+ * changes — when downloads start failing en masse, this library is the thing to bump.
+ *
+ * **Resolved URLs expire.** Nothing here is cached, and callers must re-resolve
+ * immediately before opening (or reopening) a connection.
+ */
+class StreamResolver {
+
+    suspend fun resolve(videoId: String): ResolvedStream = withContext(Dispatchers.IO) {
+        ensureInitialised()
+        val url = "https://www.youtube.com/watch?v=$videoId"
+        val info = try {
+            StreamInfo.getInfo(ServiceList.YouTube, url)
+        } catch (e: Exception) {
+            throw StreamResolutionException(
+                failure = classifyResolutionFailure(e),
+                detail = e.message?.takeIf { it.isNotBlank() },
+                cause = e,
+            )
+        }
+
+        val stream = pickBestAudio(info.audioStreams)
+            ?: throw StreamResolutionException(
+                failure = ResolutionFailure.NOT_DOWNLOADABLE,
+                detail = "No audio stream in the extracted info.",
+            )
+        // The extractor found a stream but couldn't fill in its URL, which is not a
+        // property of the video — it is the extractor coming apart on us.
+        val streamUrl = stream.content?.takeIf { it.isNotBlank() }
+            ?: throw StreamResolutionException(
+                failure = ResolutionFailure.EXTRACTOR_OUT_OF_DATE,
+                detail = "Audio stream had an empty content URL.",
+            )
+
+        ResolvedStream(
+            videoId = videoId,
+            title = info.name?.takeIf { it.isNotBlank() } ?: videoId,
+            uploader = info.uploaderName?.takeIf { it.isNotBlank() },
+            url = streamUrl,
+            fileExtension = stream.format?.suffix?.takeIf { it.isNotBlank() } ?: "m4a",
+            averageBitrate = stream.averageBitrate,
+            contentLength = stream.itagItem?.contentLength?.takeIf { it > 0 },
+            thumbnailUrls = rankThumbnails(info.thumbnails),
+        )
+    }
+
+    private companion object {
+        @Volatile
+        private var initialised = false
+
+        /** `NewPipe.init` is global and must happen exactly once per process. */
+        fun ensureInitialised() {
+            if (initialised) return
+            synchronized(this) {
+                if (initialised) return
+                NewPipe.init(NewPipeDownloader())
+                initialised = true
+            }
+        }
+    }
+}

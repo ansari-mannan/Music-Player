@@ -1,21 +1,21 @@
 package com.andres.musicplayer.data
 
 import android.content.Context
-import com.andres.musicplayer.data.id3.Id3Tag
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import com.andres.musicplayer.data.local.AppDatabase
 import com.andres.musicplayer.data.local.dao.PlaylistDao
 import com.andres.musicplayer.data.local.dao.SongDao
-import com.andres.musicplayer.data.local.dao.TagDao
 import com.andres.musicplayer.data.local.entity.Playlist
 import com.andres.musicplayer.data.local.entity.PlaylistSongCrossRef
 import com.andres.musicplayer.data.local.entity.PlaylistWithSongs
 import com.andres.musicplayer.data.local.entity.Song
-import com.andres.musicplayer.data.local.entity.SongTagCrossRef
-import com.andres.musicplayer.data.local.entity.SongWithTags
-import com.andres.musicplayer.data.local.entity.Tag
+import com.andres.musicplayer.data.tags.AudioTags
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 
 /**
  * Single entry point for the rest of the app to read/write library data.
@@ -24,12 +24,9 @@ import kotlinx.coroutines.withContext
 class SongRepository(
     private val appContext: Context,
     private val songDao: SongDao,
-    private val tagDao: TagDao,
     private val playlistDao: PlaylistDao,
 ) {
     val allSongs: Flow<List<Song>> = songDao.getAll()
-    val allSongsWithTags: Flow<List<SongWithTags>> = songDao.getAllWithTags()
-    val allTags: Flow<List<Tag>> = tagDao.getAll()
 
     suspend fun insertSong(song: Song): Long = songDao.insert(song)
 
@@ -84,69 +81,109 @@ class SongRepository(
     private fun contentKey(title: String, durationMs: Long): String =
         "${title.trim().lowercase()}|${durationMs / 1000}"
 
-    suspend fun insertTag(tag: Tag): Long = tagDao.insert(tag)
-
-    /** Links an existing song to an existing tag. */
-    suspend fun tagSong(songId: Long, tagId: Long) =
-        songDao.insertCrossRef(SongTagCrossRef(songId = songId, tagId = tagId))
-
-    /** Removes a tag from a song. */
-    suspend fun untagSong(songId: Long, tagId: Long) =
-        songDao.deleteCrossRef(songId, tagId)
-
-    suspend fun getTagByName(name: String): Tag? = tagDao.getByName(name)
-
-    suspend fun renameTag(id: Long, name: String) = tagDao.rename(id, name)
-
-    /** Deletes a tag; song links are removed automatically via the FK CASCADE. */
-    suspend fun deleteTag(id: Long) = tagDao.deleteById(id)
-
-    fun songsByTag(tagId: Long): Flow<List<SongWithTags>> =
-        songDao.getSongsWithTagsByTag(tagId)
-
-    // --- Writing tags into the actual MP3 files (so edits/moods survive a DB wipe) ---
+    // --- Writing metadata into the audio files themselves (so edits survive a DB wipe) ---
 
     /**
-     * Writes one song's current title/artist/album + moods into its file's ID3 tag.
-     * No-op (returns false) for non-SAF uris (e.g. Browse/MediaStore imports) or
-     * read-only folders. Runs off the main thread.
+     * Writes one song's current title/artist/album into its file's tag — ID3 for MP3,
+     * iTunes atoms for M4A. No-op (returns false) for non-SAF uris (e.g. Browse/
+     * MediaStore imports), read-only folders, or containers with no tag writer.
+     * Runs off the main thread.
      */
     suspend fun writeMetadataToFile(songId: Long): Boolean = withContext(Dispatchers.IO) {
-        val item = songDao.getWithTagsById(songId) ?: return@withContext false
-        if (!item.song.uri.contains("/document/")) return@withContext false
-        Id3Tag.writeTags(
+        val song = songDao.getById(songId) ?: return@withContext false
+        if (!song.uri.contains("/document/")) return@withContext false
+        AudioTags.writeTags(
             context = appContext,
-            uriString = item.song.uri,
-            title = item.song.title,
-            artist = item.song.artist,
-            album = item.song.album,
-            moods = item.tags.map { it.name },
+            uriString = song.uri,
+            title = song.title,
+            artist = song.artist,
+            album = song.album,
         )
     }
 
+    /** Outcome of a bulk metadata write: how many files took it, and how many couldn't. */
+    data class MetadataSyncResult(val written: Int, val skipped: Int)
+
     /**
-     * Writes every song's tags into its file. Reports progress as (done, total) and
-     * returns how many were successfully written. Skips non-writable uris.
+     * Writes every song's info into its file. Reports progress as (done, total).
+     *
+     * [MetadataSyncResult.skipped] counts songs whose container has no tag writer
+     * (Opus/WebM/FLAC) or whose file rejected the write, so the UI can say so instead of
+     * quietly reporting a smaller number than the user expected.
      */
-    suspend fun syncAllTagsToFiles(
+    suspend fun syncAllMetadataToFiles(
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
-    ): Int = withContext(Dispatchers.IO) {
-        val all = songDao.getAllWithTagsOnce().filter { it.song.uri.contains("/document/") }
+    ): MetadataSyncResult = withContext(Dispatchers.IO) {
+        val all = songDao.getAllOnce().filter { it.uri.contains("/document/") }
         var written = 0
-        all.forEachIndexed { index, item ->
-            val ok = Id3Tag.writeTags(
+        all.forEachIndexed { index, song ->
+            val ok = AudioTags.writeTags(
                 context = appContext,
-                uriString = item.song.uri,
-                title = item.song.title,
-                artist = item.song.artist,
-                album = item.song.album,
-                moods = item.tags.map { it.name },
+                uriString = song.uri,
+                title = song.title,
+                artist = song.artist,
+                album = song.album,
             )
             if (ok) written++
             onProgress(index + 1, all.size)
         }
+        MetadataSyncResult(written = written, skipped = all.size - written)
+    }
+
+    // --- Cover art (embedded permanently into the MP3 files) ---
+
+    /**
+     * Embeds the image at [imageUri] as one song's cover art (APIC frame), so the new
+     * thumbnail lives in the file itself and survives a DB wipe / reinstall. Returns
+     * false for non-writable (non-SAF) uris or unreadable images. Runs off the main thread.
+     */
+    suspend fun writeArtworkFromUri(songId: Long, imageUri: Uri): Boolean = withContext(Dispatchers.IO) {
+        val song = songDao.getById(songId) ?: return@withContext false
+        if (!song.uri.contains("/document/")) return@withContext false
+        val jpeg = decodeScaledJpeg(imageUri) ?: return@withContext false
+        AudioTags.writeTags(appContext,song.uri, artwork = jpeg, artworkMime = "image/jpeg")
+    }
+
+    /**
+     * Embeds [imageUri] as the cover art of every track in [album] at once. Returns how
+     * many files were updated. Skips non-writable uris.
+     */
+    suspend fun writeArtworkToAlbumFromUri(album: String, imageUri: Uri): Int = withContext(Dispatchers.IO) {
+        val jpeg = decodeScaledJpeg(imageUri) ?: return@withContext 0
+        val targets = songDao.getAllOnce().filter {
+            it.uri.contains("/document/") &&
+                (it.album?.takeIf { a -> a.isNotBlank() } ?: "Unknown album") == album
+        }
+        var written = 0
+        targets.forEach {
+            if (AudioTags.writeTags(appContext,it.uri, artwork = jpeg, artworkMime = "image/jpeg")) written++
+        }
         written
     }
+
+    /** Decodes a picked image and re-encodes it as a reasonably-sized JPEG for embedding. */
+    private fun decodeScaledJpeg(imageUri: Uri): ByteArray? = runCatching {
+        val resolver = appContext.contentResolver
+        val original = resolver.openInputStream(imageUri)?.use { BitmapFactory.decodeStream(it) }
+            ?: return null
+        val max = 1000
+        val longest = maxOf(original.width, original.height)
+        val scale = if (longest > max) max.toFloat() / longest else 1f
+        val bmp = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                original,
+                (original.width * scale).toInt().coerceAtLeast(1),
+                (original.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            original
+        }
+        ByteArrayOutputStream().use { out ->
+            bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            out.toByteArray()
+        }
+    }.getOrNull()
 
     // --- Playlists ---
 
@@ -154,7 +191,7 @@ class SongRepository(
 
     fun playlist(id: Long): Flow<Playlist?> = playlistDao.getPlaylist(id)
 
-    fun playlistSongs(id: Long): Flow<List<SongWithTags>> = playlistDao.songsInPlaylist(id)
+    fun playlistSongs(id: Long): Flow<List<Song>> = playlistDao.songsInPlaylist(id)
 
     suspend fun createPlaylist(name: String): Long =
         playlistDao.insert(Playlist(name = name))
@@ -192,7 +229,6 @@ class SongRepository(
             return SongRepository(
                 context.applicationContext,
                 db.songDao(),
-                db.tagDao(),
                 db.playlistDao(),
             )
         }

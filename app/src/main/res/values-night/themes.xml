@@ -1,4 +1,7 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Dark window theme used before Compose draws. -->
-    <style name="Theme.AndresMusicPlayer" parent="android:Theme.Material.NoActionBar" />
+    <!-- Dark window theme used before Compose draws, with a dark launch backdrop. -->
+    <style name="Theme.AndresMusicPlayer" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/splash_background</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/splash_background</item>
+    </style>
 </resources>

@@ -19,7 +19,6 @@ import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.andres.musicplayer.data.local.entity.Song
-import com.andres.musicplayer.data.local.entity.SongWithTags
 import com.andres.musicplayer.data.prefs.PlaybackStatePreferences
 import com.andres.musicplayer.playback.PlaybackService
 import kotlinx.coroutines.CoroutineScope
@@ -35,6 +34,13 @@ import kotlinx.coroutines.launch
  * [PlaybackService]. Exposes Compose state (current track, play state, position,
  * shuffle/repeat/speed, sleep timer, and the play queue) and the play/pause/skip
  * API the screens use.
+ *
+ * Queue model (VLC's `PlaylistManager`): the queue is the single source of truth for
+ * what plays next. Playlists / albums / folders only ever *load* the queue, and always
+ * replace it wholesale. Shuffle is implemented by physically reordering that queue —
+ * ExoPlayer's own shuffle mode is never used, because it keeps a hidden shuffle order
+ * over the unmodified list that the visible queue can't reflect (and which ends
+ * playback early once its internal index runs out).
  */
 @Stable
 class PlayerState(context: Context) {
@@ -48,11 +54,28 @@ class PlayerState(context: Context) {
     private val pendingActions = ArrayDeque<MediaController.() -> Unit>()
     private var sleepEndMs: Long? = null
 
-    var current by mutableStateOf<SongWithTags?>(null)
+    /**
+     * The queue order from before shuffle was turned on, restored when it is turned off.
+     * Empty whenever shuffle is off. Kept in sync as items are added to / removed from
+     * the live queue while shuffle is active.
+     */
+    private var originalQueue: List<Song> = emptyList()
+
+    /**
+     * Media ids of tracks that genuinely played, most recent last, so Previous walks back
+     * through actual listening history rather than blindly stepping to `index - 1`.
+     */
+    private val playedHistory = ArrayDeque<String>()
+    private var lastMediaId: String? = null
+
+    /** Set while stepping backwards so the resulting transition isn't pushed onto the history. */
+    private var navigatingBack = false
+
+    var current by mutableStateOf<Song?>(null)
         private set
 
     /** The full play queue, observable so the "Up next" sheet can show it. */
-    var queue by mutableStateOf<List<SongWithTags>>(emptyList())
+    var queue by mutableStateOf<List<Song>>(emptyList())
         private set
 
     /** Index of the currently playing item within [queue]. */
@@ -82,14 +105,33 @@ class PlayerState(context: Context) {
         override fun onEvents(player: Player, events: Player.Events) {
             isPlaying = player.isPlaying
             durationMs = player.duration.coerceAtLeast(0L)
-            shuffle = player.shuffleModeEnabled
             repeatMode = player.repeatMode
             speed = player.playbackParameters.speed
-            currentIndex = player.currentMediaItemIndex.coerceAtLeast(0)
+            val index = player.currentMediaItemIndex.coerceAtLeast(0)
+            currentIndex = index
+            // Resolve by position first — the queue can legitimately hold the same song
+            // twice (via "Add to queue"), so an id-only lookup would pick the wrong row.
+            val byIndex = queue.getOrNull(index)
             val id = player.currentMediaItem?.mediaId?.toLongOrNull()
-            if (id != null) {
-                queue.firstOrNull { it.song.id == id }?.let { current = it }
+            current = when {
+                byIndex != null && (id == null || byIndex.id == id) -> byIndex
+                id != null -> queue.firstOrNull { it.id == id } ?: current
+                else -> current
             }
+        }
+
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            val newId = mediaItem?.mediaId
+            val previousId = lastMediaId
+            if (previousId != null && previousId != newId) {
+                if (navigatingBack) {
+                    navigatingBack = false
+                } else {
+                    playedHistory.addLast(previousId)
+                    while (playedHistory.size > MAX_HISTORY) playedHistory.removeFirst()
+                }
+            }
+            lastMediaId = newId
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -112,23 +154,26 @@ class PlayerState(context: Context) {
             val c = future.get()
             c.addListener(listener)
             controller = c
+            // Shuffle is ours to manage: the player's own shuffle order stays off forever.
+            c.shuffleModeEnabled = false
             isPlaying = c.isPlaying
-            shuffle = c.shuffleModeEnabled
             repeatMode = c.repeatMode
             speed = c.playbackParameters.speed
             currentIndex = c.currentMediaItemIndex.coerceAtLeast(0)
+            lastMediaId = c.currentMediaItem?.mediaId
 
             // If the service restored a queue after process death, mirror it into the
             // UI state so the mini-player / Now Playing reflect it (the controller plays
-            // it already; this just rebuilds the SongWithTags list we display from).
+            // it already; this just rebuilds the Song list we display from).
             if (queue.isEmpty() && c.mediaItemCount > 0) {
                 playbackPrefs.load()?.let { saved ->
-                    queue = saved.items.map { it.toSongWithTags() }
+                    queue = saved.items.map { it.toSong() }
                     currentIndex = saved.index.coerceIn(0, queue.lastIndex)
                     current = queue.getOrNull(currentIndex)
                     positionMs = saved.positionMs
                 }
             }
+            restoreShuffleState()
 
             while (pendingActions.isNotEmpty()) {
                 pendingActions.removeFirst().invoke(c)
@@ -172,18 +217,164 @@ class PlayerState(context: Context) {
         if (c != null) c.block() else pendingActions.addLast(block)
     }
 
-    fun play(song: SongWithTags, newQueue: List<SongWithTags>) {
-        queue = newQueue
-        current = song
-        val items = newQueue.map { it.toMediaItem() }
-        val startIndex = newQueue.indexOfFirst { it.song.id == song.song.id }.coerceAtLeast(0)
-        currentIndex = startIndex
+    // ----------------------------------------------------------- loading
+
+    /**
+     * Replaces the whole queue with [newQueue] and starts playing [song]. Every "play this
+     * collection" entry point funnels through here — the queue is never appended to except
+     * via [playNext] / [addToQueue]. If shuffle is on, the new queue is loaded shuffled.
+     */
+    fun play(song: Song, newQueue: List<Song>) {
+        if (newQueue.isEmpty()) return
+        val startIndex = newQueue.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
+        loadQueue(newQueue, startIndex, shuffled = shuffle)
+    }
+
+    /**
+     * Turns shuffle on and plays [newQueue] in a freshly shuffled order, starting from a
+     * random track rather than always the first one.
+     */
+    fun playShuffled(newQueue: List<Song>) {
+        if (newQueue.isEmpty()) return
+        shuffle = true
+        loadQueue(newQueue, newQueue.indices.random(), shuffled = true)
+    }
+
+    /**
+     * Full queue replacement. When [shuffled], the queue is physically reordered with the
+     * starting track at index 0 and [originalQueue] keeps the source order for later restore.
+     */
+    private fun loadQueue(source: List<Song>, startIndex: Int, shuffled: Boolean) {
+        val start = startIndex.coerceIn(0, source.lastIndex)
+        val effective: List<Song>
+        val effectiveIndex: Int
+        if (shuffled) {
+            val order = listOf(start) + (source.indices - start).shuffled()
+            effective = order.map { source[it] }
+            effectiveIndex = 0
+            originalQueue = source
+        } else {
+            effective = source
+            effectiveIndex = start
+            originalQueue = emptyList()
+        }
+        queue = effective
+        currentIndex = effectiveIndex
+        current = effective[effectiveIndex]
+        playedHistory.clear()
+        navigatingBack = false
+        lastMediaId = effective[effectiveIndex].id.toString()
+        persistShuffleState()
+
+        val items = effective.map { it.toMediaItem() }
         withController {
-            setMediaItems(items, startIndex, 0L)
+            shuffleModeEnabled = false
+            clearMediaItems()
+            setMediaItems(items, effectiveIndex, 0L)
             prepare()
             play()
         }
     }
+
+    // ----------------------------------------------------------- shuffle
+
+    /**
+     * Toggles shuffle by physically reordering the queue. On: the queue is shuffled with
+     * the playing track moved to index 0. Off: the pre-shuffle order is restored with the
+     * playing track at its original index. Either way playback continues uninterrupted
+     * from the same position in the same song.
+     */
+    fun toggleShuffle() {
+        if (shuffle) disableShuffle() else enableShuffle()
+    }
+
+    private fun enableShuffle() {
+        shuffle = true
+        val c = controller
+        if (c == null || queue.isEmpty()) {
+            persistShuffleState()
+            return
+        }
+        val playingIndex = c.currentMediaItemIndex.coerceIn(0, queue.lastIndex)
+        val order = listOf(playingIndex) + (queue.indices - playingIndex).shuffled()
+        originalQueue = queue
+        val shuffled = order.map { queue[it] }
+        queue = shuffled
+        currentIndex = 0
+        persistShuffleState()
+        reseat(c, shuffled, 0)
+    }
+
+    private fun disableShuffle() {
+        shuffle = false
+        val c = controller
+        val original = originalQueue
+        originalQueue = emptyList()
+        persistShuffleState()
+        if (c == null || original.isEmpty()) return
+
+        val playing = queue.getOrNull(c.currentMediaItemIndex.coerceAtLeast(0))
+        val restoredIndex = if (playing == null) {
+            0
+        } else {
+            original.indexOfFirst { it === playing }
+                .takeIf { it >= 0 }
+                ?: original.indexOfFirst { it.id == playing.id }.coerceAtLeast(0)
+        }
+        queue = original
+        currentIndex = restoredIndex
+        reseat(c, original, restoredIndex)
+    }
+
+    /**
+     * Swaps the player's media items for [items] without interrupting what's playing:
+     * keeps the current position and resumes if it was playing.
+     */
+    private fun reseat(c: MediaController, items: List<Song>, index: Int) {
+        val resumeAt = c.currentPosition.coerceAtLeast(0L)
+        val wasPlaying = c.playWhenReady
+        c.shuffleModeEnabled = false
+        c.setMediaItems(items.map { it.toMediaItem() }, index, resumeAt)
+        c.prepare()
+        if (wasPlaying) c.play()
+    }
+
+    private fun persistShuffleState() {
+        prefs.edit()
+            .putBoolean(KEY_SHUFFLE, shuffle)
+            .putString(
+                KEY_ORIGINAL_ORDER,
+                if (shuffle && originalQueue.isNotEmpty()) {
+                    originalQueue.joinToString(",") { it.id.toString() }
+                } else {
+                    null
+                },
+            )
+            .apply()
+    }
+
+    /**
+     * Rebuilds [shuffle] / [originalQueue] after a process restart, so turning shuffle off
+     * still restores the order the queue had before it was shuffled.
+     */
+    private fun restoreShuffleState() {
+        shuffle = prefs.getBoolean(KEY_SHUFFLE, false)
+        if (!shuffle || queue.isEmpty()) return
+        val ids = prefs.getString(KEY_ORIGINAL_ORDER, null)
+            ?.split(",")
+            ?.mapNotNull { it.toLongOrNull() }
+            ?: return
+        val pool = queue.toMutableList()
+        val rebuilt = mutableListOf<Song>()
+        ids.forEach { id ->
+            val at = pool.indexOfFirst { it.id == id }
+            if (at >= 0) rebuilt += pool.removeAt(at)
+        }
+        rebuilt += pool // anything the saved order didn't cover keeps its relative position
+        originalQueue = rebuilt
+    }
+
+    // ----------------------------------------------------------- queue edits
 
     /** Jumps to the queue item at [index] and plays it. */
     fun playQueueItem(index: Int) {
@@ -197,15 +388,25 @@ class PlayerState(context: Context) {
     }
 
     /** Adds [song] to the end of the current queue without interrupting playback. */
-    fun addToQueue(song: SongWithTags) {
+    fun addToQueue(song: Song) {
         queue = queue + song
+        if (shuffle && originalQueue.isNotEmpty()) originalQueue = originalQueue + song
         withController { addMediaItem(song.toMediaItem()) }
     }
 
     /** Inserts [song] immediately after the currently playing track. */
-    fun playNext(song: SongWithTags) {
-        val insertAt = (currentIndex + 1).coerceAtMost(queue.size)
+    fun playNext(song: Song) {
+        val insertAt = (currentIndex + 1).coerceIn(0, queue.size)
+        val playing = queue.getOrNull(currentIndex)
         queue = queue.toMutableList().also { it.add(insertAt, song) }
+        if (shuffle && originalQueue.isNotEmpty()) {
+            val afterPlaying = playing
+                ?.let { p -> originalQueue.indexOfFirst { it === p } }
+                ?.takeIf { it >= 0 }
+                ?.plus(1)
+                ?: originalQueue.size
+            originalQueue = originalQueue.toMutableList().also { it.add(afterPlaying, song) }
+        }
         withController { addMediaItem(insertAt, song.toMediaItem()) }
     }
 
@@ -224,21 +425,58 @@ class PlayerState(context: Context) {
     /** Removes the item at [index] from the queue (cannot remove the current track). */
     fun removeFromQueue(index: Int) {
         if (index == currentIndex || index !in queue.indices) return
+        val removed = queue[index]
         queue = queue.toMutableList().also { it.removeAt(index) }
+        if (shuffle && originalQueue.isNotEmpty()) {
+            val at = originalQueue.indexOfFirst { it === removed }
+            if (at >= 0) originalQueue = originalQueue.toMutableList().also { it.removeAt(at) }
+        }
         withController { removeMediaItem(index) }
     }
+
+    // ----------------------------------------------------------- transport
 
     fun togglePlayPause() = withController {
         if (isPlaying) pause() else play()
     }
 
+    /** The queue is already in play order, so Next is a plain step forward. */
     fun next() = withController { seekToNextMediaItem() }
 
-    fun previous() = withController { seekToPreviousMediaItem() }
+    /**
+     * Restarts the current track if we're more than [RESTART_THRESHOLD_MS] into it
+     * (avoids accidental skip-backs after a long listen), otherwise steps back to the
+     * track that genuinely played before this one.
+     */
+    fun previous() {
+        val c = controller
+        if (c == null) {
+            pendingActions.addLast { seekToPreviousMediaItem() }
+            return
+        }
+        if (c.currentPosition > RESTART_THRESHOLD_MS) {
+            c.seekTo(0L)
+            positionMs = 0L
+            return
+        }
+        val playingIndex = c.currentMediaItemIndex
+        while (playedHistory.isNotEmpty()) {
+            val id = playedHistory.removeLast()
+            val index = queue.indexOfFirst { it.id.toString() == id }
+            if (index >= 0 && index != playingIndex) {
+                navigatingBack = true
+                c.seekTo(index, 0L)
+                currentIndex = index
+                current = queue[index]
+                positionMs = 0L
+                return
+            }
+        }
+        // Nothing genuinely played before this: fall back to the queue's own order.
+        if (c.hasPreviousMediaItem()) c.seekToPreviousMediaItem() else c.seekTo(0L)
+    }
 
     fun seekTo(ms: Long) = withController { seekTo(ms) }
-
-    fun toggleShuffle() = withController { shuffleModeEnabled = !shuffleModeEnabled }
 
     /** Cycles repeat: off → all (loop playlist) → one (loop track) → off. */
     fun cycleRepeat() = withController {
@@ -266,6 +504,28 @@ class PlayerState(context: Context) {
         }
     }
 
+    /**
+     * Fully stops playback and tears the session down: clears the queue and the saved
+     * playback state, and stops the player so the media notification is removed. Used
+     * when the user swipes the mini-player away to shut the app off entirely.
+     */
+    fun stopAndClear() {
+        queue = emptyList()
+        originalQueue = emptyList()
+        playedHistory.clear()
+        lastMediaId = null
+        current = null
+        currentIndex = 0
+        isPlaying = false
+        positionMs = 0L
+        playbackPrefs.clear()
+        persistShuffleState()
+        withController {
+            stop()
+            clearMediaItems()
+        }
+    }
+
     fun clearPlaybackError() { playbackError = null }
 
     fun release() {
@@ -278,27 +538,30 @@ class PlayerState(context: Context) {
     private companion object {
         const val PREFS_NAME = "player_state"
         const val KEY_SLEEP_END = "sleep_end_ms"
+        const val KEY_SHUFFLE = "shuffle_enabled"
+        const val KEY_ORIGINAL_ORDER = "shuffle_original_order"
+
+        /** Past this far into a track, Previous restarts it instead of going back (VLC). */
+        const val RESTART_THRESHOLD_MS = 5_000L
+        const val MAX_HISTORY = 100
     }
 }
 
-private fun SongWithTags.toMediaItem(): MediaItem =
+private fun Song.toMediaItem(): MediaItem =
     MediaItem.Builder()
-        .setMediaId(song.id.toString())
-        .setUri(song.uri)
+        .setMediaId(id.toString())
+        .setUri(uri)
         .setMediaMetadata(
             MediaMetadata.Builder()
-                .setTitle(song.title)
-                .setArtist(song.artist)
+                .setTitle(title)
+                .setArtist(artist)
                 .build(),
         )
         .build()
 
-/** Rebuilds a display-only [SongWithTags] from a saved queue item (no tags/duration). */
-private fun PlaybackStatePreferences.Item.toSongWithTags(): SongWithTags =
-    SongWithTags(
-        song = Song(id = id, uri = uri, title = title, artist = artist, durationMs = 0L),
-        tags = emptyList(),
-    )
+/** Rebuilds a display-only [Song] from a saved queue item (no duration). */
+private fun PlaybackStatePreferences.Item.toSong(): Song =
+    Song(id = id, uri = uri, title = title, artist = artist, durationMs = 0L)
 
 @Composable
 fun rememberPlayerState(): PlayerState {

@@ -89,27 +89,6 @@ fun SkipPreviousIcon(modifier: Modifier = Modifier, tint: Color = LocalContentCo
     }
 }
 
-/** Three level bars — used as the "generate mix" icon (evokes the mood sliders). */
-@Composable
-fun MixIcon(modifier: Modifier = Modifier, tint: Color = LocalContentColor.current) {
-    Canvas(modifier) {
-        val w = size.width
-        val h = size.height
-        val barW = w * 0.16f
-        val centers = listOf(0.26f, 0.50f, 0.74f)
-        val heights = listOf(0.45f, 0.78f, 0.32f)
-        centers.forEachIndexed { i, cx ->
-            val barH = h * heights[i]
-            drawRoundRect(
-                tint,
-                Offset(w * cx - barW / 2, h - h * 0.12f - barH),
-                Size(barW, barH),
-                CornerRadius(barW * 0.5f),
-            )
-        }
-    }
-}
-
 @Composable
 fun PlusIcon(modifier: Modifier = Modifier, tint: Color = LocalContentColor.current) {
     Canvas(modifier) {

@@ -2,7 +2,11 @@
     <!--
       Compose handles app theming (see ui/theme/Theme.kt). This XML theme only
       controls the window before Compose draws, so it just needs a NoActionBar
-      base. Light variant here; dark variant in values-night.
+      base. The window + splash background are forced dark so the launch screen
+      (and the brief pre-Compose frame) is a dark backdrop rather than grey.
     -->
-    <style name="Theme.AndresMusicPlayer" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.AndresMusicPlayer" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/splash_background</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/splash_background</item>
+    </style>
 </resources>

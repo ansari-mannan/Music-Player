@@ -9,10 +9,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,7 +22,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -35,18 +32,18 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.andres.musicplayer.data.local.entity.SongWithTags
+import com.andres.musicplayer.data.local.entity.Song
 import com.andres.musicplayer.ui.art.SongArtwork
 import com.andres.musicplayer.ui.util.formatDuration
 
 /**
  * One song row. Tap to play (or toggle when selecting), long-press to start a
- * selection. Highlights when playing or selected, shows tag pills, and can host
- * an optional [trailing] control (e.g. a per-row queue menu).
+ * selection. Highlights when playing or selected, and can host an optional
+ * [trailing] control (e.g. a per-row queue menu).
  */
 @Composable
 fun SongRow(
-    item: SongWithTags,
+    item: Song,
     isPlaying: Boolean,
     isSelected: Boolean,
     selectionMode: Boolean,
@@ -55,7 +52,6 @@ fun SongRow(
     modifier: Modifier = Modifier.fillMaxWidth(),
     trailing: (@Composable () -> Unit)? = null,
 ) {
-    val tagged = item.tags.isNotEmpty()
     Row(
         modifier = modifier
             .background(
@@ -70,7 +66,7 @@ fun SongRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box {
-            SongArtwork(uri = item.song.uri, size = 48.dp)
+            SongArtwork(uri = item.uri, size = 48.dp)
             if (selectionMode && isSelected) {
                 Box(
                     modifier = Modifier
@@ -97,7 +93,7 @@ fun SongRow(
                     Spacer(Modifier.width(6.dp))
                 }
                 Text(
-                    text = item.song.title,
+                    text = item.title,
                     style = MaterialTheme.typography.titleMedium,
                     color = if (isPlaying) {
                         MaterialTheme.colorScheme.primary
@@ -109,22 +105,12 @@ fun SongRow(
                 )
             }
             Text(
-                text = "${item.song.artist ?: "Unknown artist"} · ${formatDuration(item.song.durationMs)}",
+                text = "${item.artist ?: "Unknown artist"} · ${formatDuration(item.durationMs)}",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            if (tagged) {
-                FlowRow(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    item.tags.forEach { tag -> TagPill(tag.name) }
-                }
-            }
         }
 
         if (trailing != null) {
@@ -166,17 +152,3 @@ fun AnimatedEqualizerBars(
     }
 }
 
-@Composable
-fun TagPill(name: String) {
-    Surface(
-        color = MaterialTheme.colorScheme.secondaryContainer,
-        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-        shape = RoundedCornerShape(50),
-    ) {
-        Text(
-            text = name,
-            style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
-        )
-    }
-}

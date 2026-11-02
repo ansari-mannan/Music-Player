@@ -1,19 +1,25 @@
 package com.andres.musicplayer.ui.albums
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -27,6 +33,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.andres.musicplayer.data.SongRepository
+import com.andres.musicplayer.ui.art.ArtworkVersion
 import com.andres.musicplayer.ui.art.SongArtwork
 import com.andres.musicplayer.ui.common.EmptyState
 import com.andres.musicplayer.ui.playlists.AddToPlaylistDialog
@@ -49,23 +56,38 @@ fun AlbumsScreen(
     onAlbumClick: (name: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val songs by repo.allSongsWithTags.collectAsState(initial = emptyList())
+    val songs by repo.allSongs.collectAsState(initial = emptyList())
     val playlists by repo.allPlaylistsWithSongs.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
     var addTarget by remember { mutableStateOf<String?>(null) }
+    var manageAlbum by remember { mutableStateOf<String?>(null) }
+    // The album whose artwork the picker (below) will apply to, captured at launch.
+    var artworkAlbum by remember { mutableStateOf<String?>(null) }
+
+    val artworkPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri ->
+        val album = artworkAlbum
+        if (uri != null && album != null) {
+            scope.launch {
+                if (repo.writeArtworkToAlbumFromUri(album, uri) > 0) ArtworkVersion.bump()
+            }
+        }
+        artworkAlbum = null
+    }
 
     fun songIdsFor(album: String): List<Long> =
-        songs.filter { (it.song.album?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ALBUM) == album }
-            .map { it.song.id }
+        songs.filter { (it.album?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ALBUM) == album }
+            .map { it.id }
 
     val albums = remember(songs) {
-        songs.groupBy { it.song.album?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ALBUM }
+        songs.groupBy { it.album?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ALBUM }
             .map { (name, list) ->
                 AlbumEntry(
                     name = name,
-                    artist = list.firstOrNull { !it.song.artist.isNullOrBlank() }?.song?.artist,
+                    artist = list.firstOrNull { !it.artist.isNullOrBlank() }?.artist,
                     count = list.size,
-                    sampleUri = list.firstOrNull()?.song?.uri,
+                    sampleUri = list.firstOrNull()?.uri,
                 )
             }
             // Real albums sorted alphabetically; the Unknown bucket always last.
@@ -95,7 +117,7 @@ fun AlbumsScreen(
             Column(
                 modifier = Modifier.combinedClickable(
                     onClick = { onAlbumClick(entry.name) },
-                    onLongClick = { addTarget = entry.name },
+                    onLongClick = { manageAlbum = entry.name },
                 ),
             ) {
                 SongArtwork(uri = entry.sampleUri, size = coverSize)
@@ -119,6 +141,30 @@ fun AlbumsScreen(
         }
     }
 
+    manageAlbum?.let { album ->
+        AlertDialog(
+            onDismissRequest = { manageAlbum = null },
+            title = { Text(album) },
+            text = {
+                Column {
+                    AlbumActionRow("Add to playlist") {
+                        addTarget = album
+                        manageAlbum = null
+                    }
+                    AlbumActionRow("Change album artwork") {
+                        artworkAlbum = album
+                        manageAlbum = null
+                        artworkPicker.launch("image/*")
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { manageAlbum = null }) { Text("Cancel") }
+            },
+        )
+    }
+
     addTarget?.let { album ->
         val ids = songIdsFor(album)
         AddToPlaylistDialog(
@@ -137,4 +183,16 @@ fun AlbumsScreen(
             onDismiss = { addTarget = null },
         )
     }
+}
+
+@Composable
+private fun AlbumActionRow(label: String, onClick: () -> Unit) {
+    Text(
+        text = label,
+        style = MaterialTheme.typography.bodyLarge,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 12.dp),
+    )
 }

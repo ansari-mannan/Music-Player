@@ -45,6 +45,10 @@ class PlaybackService : MediaSessionService() {
             .setHandleAudioBecomingNoisy(true)
             .build()
 
+        // Shuffle is implemented by physically reordering the queue (see PlayerState),
+        // so ExoPlayer's own hidden shuffle order must stay off permanently.
+        player.shuffleModeEnabled = false
+
         // Force a stable audio session id up front so the effects can attach
         // before any playback (ExoPlayer otherwise allocates it lazily).
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager

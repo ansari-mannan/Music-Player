@@ -7,4 +7,6 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <!-- Dark backdrop shown behind the launch logo before Compose draws. -->
+    <color name="splash_background">#FF0E0E12</color>
 </resources>

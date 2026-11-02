@@ -4,6 +4,9 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import coil3.ImageLoader
 import coil3.asImage
 import coil3.decode.DataSource
@@ -12,8 +15,23 @@ import coil3.fetch.Fetcher
 import coil3.fetch.ImageFetchResult
 import coil3.request.Options
 
-/** Coil model: "load the embedded cover art of this audio file". */
-data class AudioArt(val uri: Uri)
+/**
+ * Coil model: "load the embedded cover art of this audio file".
+ *
+ * [version] is part of the cache key only: bumping [ArtworkVersion.value] (after we
+ * embed new art into a file) makes every [AudioArt] key change, so Coil re-reads the
+ * file instead of serving the stale cached cover.
+ */
+data class AudioArt(val uri: Uri, val version: Int = ArtworkVersion.value)
+
+/** Process-wide counter that invalidates cached cover art when artwork is edited. */
+object ArtworkVersion {
+    var value by mutableIntStateOf(0)
+        private set
+
+    /** Call after embedding new artwork so visible covers reload. */
+    fun bump() { value++ }
+}
 
 /**
  * Extracts the embedded picture (ID3 cover art) from an MP3 via

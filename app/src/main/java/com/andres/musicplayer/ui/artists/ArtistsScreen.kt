@@ -42,20 +42,20 @@ fun ArtistsScreen(
     onArtistClick: (name: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val songs by repo.allSongsWithTags.collectAsState(initial = emptyList())
+    val songs by repo.allSongs.collectAsState(initial = emptyList())
     val playlists by repo.allPlaylistsWithSongs.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
     var addTarget by remember { mutableStateOf<String?>(null) }
     val artists = remember(songs) {
-        songs.groupBy { it.song.artist?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ARTIST }
-            .map { (name, list) -> ArtistEntry(name, list.size, list.firstOrNull()?.song?.uri) }
+        songs.groupBy { it.artist?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ARTIST }
+            .map { (name, list) -> ArtistEntry(name, list.size, list.firstOrNull()?.uri) }
             // Real artists sorted alphabetically; the Unknown bucket always last.
             .sortedWith(compareBy({ it.name == UNKNOWN_ARTIST }, { it.name.lowercase() }))
     }
 
     fun songIdsFor(artist: String): List<Long> =
-        songs.filter { (it.song.artist?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ARTIST) == artist }
-            .map { it.song.id }
+        songs.filter { (it.artist?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ARTIST) == artist }
+            .map { it.id }
 
     if (artists.isEmpty()) {
         EmptyState(

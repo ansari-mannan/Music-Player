@@ -58,7 +58,7 @@ fun PlaylistsScreen(
         if (playlists.isEmpty()) {
             EmptyState(
                 title = "No playlists yet",
-                body = "Tap + to create one, or generate a mix and save it.",
+                body = "Tap + to create one.",
             )
         } else {
             LazyVerticalGrid(

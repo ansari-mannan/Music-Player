@@ -20,13 +20,12 @@ fun SongsScreen(
     modifier: Modifier = Modifier,
 ) {
     // null = first load in progress (avoids an empty-state flash).
-    val songs by repo.allSongsWithTags.collectAsState(initial = null)
-    val tags by repo.allTags.collectAsState(initial = emptyList())
+    val songs by repo.allSongs.collectAsState(initial = null)
 
     when {
         folderUri == null -> EmptyState(
             title = "Welcome to ${LocalAppTitle.current}",
-            body = "Pick the folder your MP3s are downloaded into to build your library.",
+            body = "Pick the folder your music is downloaded into to build your library.",
             buttonText = "Choose music folder",
             onButtonClick = onPickFolder,
             modifier = modifier,
@@ -36,7 +35,7 @@ fun SongsScreen(
 
         songs!!.isEmpty() -> EmptyState(
             title = "No songs yet",
-            body = "Tap the ⟳ button in the header to scan your folder for MP3s.",
+            body = "Tap the ⟳ button in the header to scan your folder for music.",
             modifier = modifier,
         )
 
@@ -46,13 +45,11 @@ fun SongsScreen(
             capabilities = setOf(
                 SongListCapability.PLAY,
                 SongListCapability.MULTI_SELECT,
-                SongListCapability.TAG,
                 SongListCapability.EDIT_INFO,
                 SongListCapability.DELETE_FROM_LIBRARY,
                 SongListCapability.QUEUE_ACTIONS,
             ),
             repo = repo,
-            allTags = tags,
             modifier = modifier,
         )
     }

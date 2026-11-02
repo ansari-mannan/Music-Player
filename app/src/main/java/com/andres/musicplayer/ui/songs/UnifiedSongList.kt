@@ -2,6 +2,7 @@ package com.andres.musicplayer.ui.songs
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -21,17 +22,15 @@ import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,18 +47,24 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.andres.musicplayer.data.SongRepository
-import com.andres.musicplayer.data.local.entity.SongWithTags
-import com.andres.musicplayer.data.local.entity.Tag
+import com.andres.musicplayer.data.local.entity.Song
+import com.andres.musicplayer.ui.art.ArtworkVersion
 import com.andres.musicplayer.ui.player.PlayerState
+import com.andres.musicplayer.ui.util.ArtSaveRequest
+import com.andres.musicplayer.ui.util.rememberArtworkSaver
 import com.andres.musicplayer.ui.playlists.AddToPlaylistDialog
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+/** Pixels per frame the list auto-scrolls while a dragged row is held near an edge. */
+private const val EDGE_SCROLL_STEP = 14f
 
 /** What a given song list is allowed to do. Action UI appears only for the caps present. */
 enum class SongListCapability {
     PLAY,
     MULTI_SELECT,
-    TAG,
     EDIT_INFO,
     DELETE_FROM_LIBRARY,
     REMOVE_FROM_PLAYLIST,
@@ -68,20 +73,18 @@ enum class SongListCapability {
 
 /**
  * The single song-list used everywhere. Tap to play; the rest of the behaviour
- * (multi-select, tag, edit, delete, remove-from-playlist, queue actions) is
- * switched on via [capabilities]. [repo]/[allTags] are required for the
- * tag/edit/delete/add-to-playlist actions; [onRemoveFromPlaylist] for removal.
+ * (multi-select, edit, delete, remove-from-playlist, queue actions) is switched on
+ * via [capabilities]. [repo] is required for the edit/delete/add-to-playlist
+ * actions; [onRemoveFromPlaylist] for removal.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UnifiedSongList(
-    songs: List<SongWithTags>,
+    songs: List<Song>,
     player: PlayerState,
     capabilities: Set<SongListCapability>,
     modifier: Modifier = Modifier,
     onRemoveFromPlaylist: ((songId: Long) -> Unit)? = null,
     repo: SongRepository? = null,
-    allTags: List<Tag> = emptyList(),
     // When true (Browse), songs aren't yet in the library, so adding to a playlist
     // imports them first to obtain real library ids.
     importForPlaylist: Boolean = false,
@@ -90,8 +93,8 @@ fun UnifiedSongList(
     onMove: ((from: Int, to: Int) -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
+    val saveArtwork = rememberArtworkSaver()
     val multiSelect = SongListCapability.MULTI_SELECT in capabilities
-    val canTag = SongListCapability.TAG in capabilities && repo != null
     val canEdit = SongListCapability.EDIT_INFO in capabilities && repo != null
     val canDelete = SongListCapability.DELETE_FROM_LIBRARY in capabilities && repo != null
     val canRemove = SongListCapability.REMOVE_FROM_PLAYLIST in capabilities && onRemoveFromPlaylist != null
@@ -103,14 +106,13 @@ fun UnifiedSongList(
     val playlists by playlistsFlow.collectAsState(initial = emptyList())
 
     var selectedIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
-    var showTagSheet by remember { mutableStateOf(false) }
-    var editSong by remember { mutableStateOf<SongWithTags?>(null) }
+    var editSong by remember { mutableStateOf<Song?>(null) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showPlaylistPicker by remember { mutableStateOf(false) }
     val selectionMode = multiSelect && selectedIds.isNotEmpty()
 
     fun clearSelection() { selectedIds = emptySet() }
-    val selectedSongs = songs.filter { it.song.id in selectedIds }
+    val selectedSongs = songs.filter { it.id in selectedIds }
 
     Column(modifier = modifier.fillMaxSize()) {
         if (selectionMode) {
@@ -118,19 +120,21 @@ fun UnifiedSongList(
                 count = selectedIds.size,
                 singleSelected = selectedIds.size == 1,
                 canAddToPlaylist = canAddToPlaylist,
-                canTag = canTag,
                 canEdit = canEdit,
                 canDelete = canDelete,
                 canRemove = canRemove,
                 canQueue = canQueue && player.current != null,
                 onClose = { clearSelection() },
-                onSelectAll = { selectedIds = songs.map { it.song.id }.toSet() },
+                onSelectAll = { selectedIds = songs.map { it.id }.toSet() },
                 onAddToPlaylist = { showPlaylistPicker = true },
-                onTag = { showTagSheet = true },
+                onSaveArtwork = {
+                    saveArtwork(selectedSongs.map { ArtSaveRequest(it.uri, it.title) })
+                    clearSelection()
+                },
                 onEdit = { editSong = selectedSongs.firstOrNull() },
                 onDelete = { showDeleteConfirm = true },
                 onRemove = {
-                    selectedSongs.forEach { onRemoveFromPlaylist?.invoke(it.song.id) }
+                    selectedSongs.forEach { onRemoveFromPlaylist?.invoke(it.id) }
                     clearSelection()
                 },
                 onPlayNext = {
@@ -152,12 +156,56 @@ fun UnifiedSongList(
         var startIndex by remember { mutableStateOf<Int?>(null) }
         var dragOffsetY by remember { mutableStateOf(0f) }
 
+        // Swaps the dragged row with its neighbour once it's been dragged past half a
+        // row's height — shared by the pointer drag and the edge auto-scroll below.
+        fun trySwap() {
+            val cur = draggingIndex ?: return
+            val h = listState.layoutInfo.visibleItemsInfo.find { it.index == cur }?.size ?: return
+            if (h <= 0) return
+            if (dragOffsetY > h / 2 && cur < items.lastIndex) {
+                items.add(cur + 1, items.removeAt(cur))
+                draggingIndex = cur + 1
+                dragOffsetY -= h
+            } else if (dragOffsetY < -h / 2 && cur > 0) {
+                items.add(cur - 1, items.removeAt(cur))
+                draggingIndex = cur - 1
+                dragOffsetY += h
+            }
+        }
+
+        // While a row is held near the top/bottom edge, keep scrolling the list so the
+        // user can drag a song all the way up/down in one motion (not in stops).
+        LaunchedEffect(draggingIndex) {
+            if (draggingIndex == null) return@LaunchedEffect
+            while (isActive && draggingIndex != null) {
+                val cur = draggingIndex
+                val info = listState.layoutInfo
+                val item = info.visibleItemsInfo.find { it.index == cur }
+                if (item != null) {
+                    val edge = item.size.coerceAtMost(140)
+                    val top = item.offset + dragOffsetY
+                    val bottom = top + item.size
+                    val delta = when {
+                        top < info.viewportStartOffset + edge -> -EDGE_SCROLL_STEP
+                        bottom > info.viewportEndOffset - edge -> EDGE_SCROLL_STEP
+                        else -> 0f
+                    }
+                    if (delta != 0f) {
+                        val consumed = listState.scrollBy(delta)
+                        dragOffsetY += consumed
+                        trySwap()
+                    }
+                }
+                delay(16)
+            }
+        }
+
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 12.dp),
         ) {
-            itemsIndexed(items = items, key = { _, item -> item.song.id }) { index, item ->
+            itemsIndexed(items = items, key = { _, item -> item.id }) { index, item ->
                 val liveIndex by rememberUpdatedState(index)
                 val isDragging = canReorder && index == draggingIndex
                 Column(
@@ -177,13 +225,13 @@ fun UnifiedSongList(
                 ) {
                     val rowOnClick = {
                         if (selectionMode) {
-                            selectedIds = selectedIds.toggle(item.song.id)
+                            selectedIds = selectedIds.toggle(item.id)
                         } else {
                             player.play(item, items)
                         }
                     }
                     val rowOnLongClick = {
-                        if (multiSelect) selectedIds = selectedIds + item.song.id
+                        if (multiSelect) selectedIds = selectedIds + item.id
                     }
                     if (canReorder && !selectionMode) {
                         // Handle is a SIBLING of the row, outside its clickable, so a
@@ -191,8 +239,8 @@ fun UnifiedSongList(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             SongRow(
                                 item = item,
-                                isPlaying = player.current?.song?.id == item.song.id,
-                                isSelected = item.song.id in selectedIds,
+                                isPlaying = player.current?.id == item.id,
+                                isSelected = item.id in selectedIds,
                                 selectionMode = selectionMode,
                                 onClick = rowOnClick,
                                 onLongClick = rowOnLongClick,
@@ -206,22 +254,7 @@ fun UnifiedSongList(
                                 },
                                 onDrag = { dy ->
                                     dragOffsetY += dy
-                                    val cur = draggingIndex
-                                    if (cur != null) {
-                                        val h = listState.layoutInfo.visibleItemsInfo
-                                            .find { it.index == cur }?.size ?: 0
-                                        if (h > 0) {
-                                            if (dragOffsetY > h / 2 && cur < items.lastIndex) {
-                                                items.add(cur + 1, items.removeAt(cur))
-                                                draggingIndex = cur + 1
-                                                dragOffsetY -= h
-                                            } else if (dragOffsetY < -h / 2 && cur > 0) {
-                                                items.add(cur - 1, items.removeAt(cur))
-                                                draggingIndex = cur - 1
-                                                dragOffsetY += h
-                                            }
-                                        }
-                                    }
+                                    trySwap()
                                 },
                                 onDragEnd = {
                                     val from = startIndex
@@ -238,8 +271,8 @@ fun UnifiedSongList(
                     } else {
                         SongRow(
                             item = item,
-                            isPlaying = player.current?.song?.id == item.song.id,
-                            isSelected = item.song.id in selectedIds,
+                            isPlaying = player.current?.id == item.id,
+                            isSelected = item.id in selectedIds,
                             selectionMode = selectionMode,
                             onClick = rowOnClick,
                             onLongClick = rowOnLongClick,
@@ -259,69 +292,23 @@ fun UnifiedSongList(
         }
     }
 
-    // Tag editor for the current selection (1 or many songs).
-    if (showTagSheet && repo != null) {
-        if (selectedSongs.isEmpty()) {
-            showTagSheet = false
-        } else {
-            val appliedToAll = remember(selectedSongs, allTags) {
-                allTags.filter { tag -> selectedSongs.all { s -> s.tags.any { it.id == tag.id } } }
-                    .map { it.id }
-                    .toSet()
-            }
-            val sheetState = rememberModalBottomSheetState()
-            ModalBottomSheet(
-                onDismissRequest = {
-                    showTagSheet = false
-                    // Persist the moods we just changed into each song's file.
-                    val ids = selectedSongs.map { it.song.id }
-                    scope.launch { ids.forEach { repo.writeMetadataToFile(it) } }
-                },
-                sheetState = sheetState,
-            ) {
-                TagSheetContent(
-                    title = if (selectedSongs.size == 1) selectedSongs.first().song.title else "${selectedSongs.size} songs",
-                    subtitle = if (selectedSongs.size == 1) {
-                        selectedSongs.first().song.artist ?: "Unknown artist"
-                    } else {
-                        "Apply tags to all selected"
-                    },
-                    allTags = allTags,
-                    appliedTagIds = appliedToAll,
-                    onToggleTag = { tagId, isAppliedToAll ->
-                        scope.launch {
-                            selectedSongs.forEach { s ->
-                                if (isAppliedToAll) repo.untagSong(s.song.id, tagId)
-                                else repo.tagSong(s.song.id, tagId)
-                            }
-                        }
-                    },
-                    onCreateTag = { name ->
-                        if (name.isNotBlank()) {
-                            scope.launch {
-                                val newId = repo.insertTag(Tag(name = name))
-                                val tagId = if (newId != -1L) newId else repo.getTagByName(name)?.id
-                                if (tagId != null) selectedSongs.forEach { repo.tagSong(it.song.id, tagId) }
-                            }
-                        }
-                    },
-                )
-            }
-        }
-    }
-
     if (repo != null) {
         editSong?.let { editing ->
             EditInfoDialog(
-                song = editing.song,
+                song = editing,
                 onDismiss = { editSong = null },
                 onSave = { title, artist, album ->
                     scope.launch {
-                        repo.updateSongInfo(editing.song.id, title, artist, album)
-                        repo.writeMetadataToFile(editing.song.id)
+                        repo.updateSongInfo(editing.id, title, artist, album)
+                        repo.writeMetadataToFile(editing.id)
                     }
                     editSong = null
                     clearSelection()
+                },
+                onChangeArtwork = { imageUri ->
+                    scope.launch {
+                        if (repo.writeArtworkFromUri(editing.id, imageUri)) ArtworkVersion.bump()
+                    }
                 },
             )
         }
@@ -329,7 +316,7 @@ fun UnifiedSongList(
 
     if (showPlaylistPicker && repo != null) {
         // Capture the songs now; selection is cleared as soon as the dialog acts.
-        val targetSongs = selectedSongs.map { it.song }
+        val targetSongs = selectedSongs
         AddToPlaylistDialog(
             playlists = playlists,
             onPick = { playlistId ->
@@ -416,7 +403,7 @@ private fun DragHandle(
 
 /** Per-row overflow menu offering the queue actions when something is playing. */
 @Composable
-private fun RowQueueMenu(player: PlayerState, item: SongWithTags) {
+private fun RowQueueMenu(player: PlayerState, item: Song) {
     var open by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }) {
@@ -440,7 +427,6 @@ private fun SelectionBar(
     count: Int,
     singleSelected: Boolean,
     canAddToPlaylist: Boolean,
-    canTag: Boolean,
     canEdit: Boolean,
     canDelete: Boolean,
     canRemove: Boolean,
@@ -448,7 +434,7 @@ private fun SelectionBar(
     onClose: () -> Unit,
     onSelectAll: () -> Unit,
     onAddToPlaylist: () -> Unit,
-    onTag: () -> Unit,
+    onSaveArtwork: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onRemove: () -> Unit,
@@ -495,12 +481,11 @@ private fun SelectionBar(
                             onClick = { menuOpen = false; onAddToPlaylist() },
                         )
                     }
-                    if (canTag) {
-                        DropdownMenuItem(
-                            text = { Text("Tag") },
-                            onClick = { menuOpen = false; onTag() },
-                        )
-                    }
+                    // Saving cover art is universally applicable, so always offered.
+                    DropdownMenuItem(
+                        text = { Text(if (singleSelected) "Save artwork" else "Save artwork ($count)") },
+                        onClick = { menuOpen = false; onSaveArtwork() },
+                    )
                     if (canEdit && singleSelected) {
                         DropdownMenuItem(
                             text = { Text("Edit info") },

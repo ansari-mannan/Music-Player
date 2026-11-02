@@ -1,3 +1,6 @@
 <resources>
     <string name="app_name">Andres\' Music Player</string>
+    <!-- Shown under the launcher icon in the app drawer. Kept generic; the in-app
+         personalised title ("<name>'s Music Player") is built separately in code. -->
+    <string name="launcher_label">Music Player</string>
 </resources>

@@ -3,6 +3,8 @@ package com.andres.musicplayer.ui.player
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,7 +64,15 @@ import com.andres.musicplayer.ui.art.SongArtwork
 import com.andres.musicplayer.ui.art.SongArtworkGlow
 import com.andres.musicplayer.ui.common.EmptyState
 import com.andres.musicplayer.ui.songs.EditInfoDialog
+import com.andres.musicplayer.ui.util.ArtSaveRequest
 import com.andres.musicplayer.ui.util.formatDuration
+import com.andres.musicplayer.ui.util.rememberArtworkSaver
+import com.andres.musicplayer.ui.util.rememberMonoController
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+
+/** Pixels per frame the queue auto-scrolls while a dragged row is held near an edge. */
+private const val QUEUE_EDGE_SCROLL_STEP = 14f
 
 /** Full-screen player: blurred-art backdrop, live seek bar, full transport controls. */
 @Composable
@@ -69,9 +80,13 @@ fun NowPlayingScreen(
     player: PlayerState,
     onBack: () -> Unit,
     onSaveInfo: (id: Long, title: String, artist: String?, album: String?) -> Unit,
+    onChangeArtwork: (id: Long, imageUri: android.net.Uri) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val current = player.current
+    val mono = rememberMonoController()
+    val saveArtwork = rememberArtworkSaver()
+
     var scrubFraction by remember { mutableStateOf<Float?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var showSpeedDialog by remember { mutableStateOf(false) }
@@ -139,6 +154,17 @@ fun NowPlayingScreen(
                             onClick = { menuOpen = false; showSleepDialog = true },
                         )
                         DropdownMenuItem(
+                            text = { Text(if (mono.isOn) "Mono audio: On" else "Mono audio: Off") },
+                            onClick = { menuOpen = false; mono.toggle() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Save artwork") },
+                            onClick = {
+                                menuOpen = false
+                                saveArtwork(listOf(ArtSaveRequest(current.uri, current.title)))
+                            },
+                        )
+                        DropdownMenuItem(
                             text = { Text("Edit info") },
                             onClick = { menuOpen = false; showEditDialog = true },
                         )
@@ -149,21 +175,41 @@ fun NowPlayingScreen(
 
             Spacer(Modifier.weight(1f))
 
-            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    // Swipe the artwork left/right to go to the next/previous track.
+                    .pointerInput(current.id) {
+                        var totalDx = 0f
+                        val threshold = size.width * 0.18f
+                        detectHorizontalDragGestures(
+                            onDragStart = { totalDx = 0f },
+                            onHorizontalDrag = { _, dragAmount -> totalDx += dragAmount },
+                            onDragEnd = {
+                                when {
+                                    totalDx <= -threshold -> player.next()
+                                    totalDx >= threshold -> player.previous()
+                                }
+                                totalDx = 0f
+                            },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
                 // Blurred glow radiating from behind the crisp artwork's center.
                 SongArtworkGlow(
-                    uri = current.song.uri,
+                    uri = current.uri,
                     modifier = Modifier
                         .fillMaxWidth()
                         .aspectRatio(1f),
                 )
-                SongArtwork(uri = current.song.uri, size = 280.dp)
+                SongArtwork(uri = current.uri, size = 280.dp)
             }
 
             Spacer(Modifier.height(28.dp))
 
             Text(
-                text = current.song.title,
+                text = current.title,
                 style = MaterialTheme.typography.headlineSmall,
                 textAlign = TextAlign.Center,
                 maxLines = 2,
@@ -171,7 +217,7 @@ fun NowPlayingScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(
-                text = current.song.artist ?: "Unknown artist",
+                text = current.artist ?: "Unknown artist",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -180,7 +226,7 @@ fun NowPlayingScreen(
 
             Spacer(Modifier.weight(1f))
 
-            val duration = if (player.durationMs > 0) player.durationMs else current.song.durationMs
+            val duration = if (player.durationMs > 0) player.durationMs else current.durationMs
             val liveFraction = if (duration > 0) player.positionMs.toFloat() / duration else 0f
             val shownFraction = scrubFraction ?: liveFraction
             val shownPositionMs = scrubFraction?.let { (it * duration).toLong() } ?: player.positionMs
@@ -272,12 +318,13 @@ fun NowPlayingScreen(
     }
     if (showEditDialog) {
         EditInfoDialog(
-            song = current.song,
+            song = current,
             onDismiss = { showEditDialog = false },
             onSave = { title, artist, album ->
-                onSaveInfo(current.song.id, title, artist, album)
+                onSaveInfo(current.id, title, artist, album)
                 showEditDialog = false
             },
+            onChangeArtwork = { imageUri -> onChangeArtwork(current.id, imageUri) },
         )
     }
     if (showQueueSheet) {
@@ -291,7 +338,7 @@ fun NowPlayingScreen(
 private fun QueueSheet(player: PlayerState, onDismiss: () -> Unit) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val queue = player.queue
-    val playingSongId = player.current?.song?.id
+    val playingSongId = player.current?.id
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Text(
@@ -325,7 +372,7 @@ private fun QueueSheet(player: PlayerState, onDismiss: () -> Unit) {
  */
 @Composable
 private fun DraggableQueueList(
-    queue: List<com.andres.musicplayer.data.local.entity.SongWithTags>,
+    queue: List<com.andres.musicplayer.data.local.entity.Song>,
     playingSongId: Long?,
     onTap: (Int) -> Unit,
     onRemove: (Int) -> Unit,
@@ -338,14 +385,56 @@ private fun DraggableQueueList(
     var startIndex by remember { mutableStateOf<Int?>(null) }
     var dragOffsetY by remember { mutableStateOf(0f) }
 
+    fun trySwap() {
+        val cur = draggingIndex ?: return
+        val h = listState.layoutInfo.visibleItemsInfo.find { it.index == cur }?.size ?: return
+        if (h <= 0) return
+        if (dragOffsetY > h / 2 && cur < items.lastIndex) {
+            items.add(cur + 1, items.removeAt(cur))
+            draggingIndex = cur + 1
+            dragOffsetY -= h
+        } else if (dragOffsetY < -h / 2 && cur > 0) {
+            items.add(cur - 1, items.removeAt(cur))
+            draggingIndex = cur - 1
+            dragOffsetY += h
+        }
+    }
+
+    // Auto-scroll the queue while a row is held near an edge so it can be dragged the
+    // whole way in one motion instead of in stops.
+    LaunchedEffect(draggingIndex) {
+        if (draggingIndex == null) return@LaunchedEffect
+        while (isActive && draggingIndex != null) {
+            val cur = draggingIndex
+            val info = listState.layoutInfo
+            val item = info.visibleItemsInfo.find { it.index == cur }
+            if (item != null) {
+                val edge = item.size.coerceAtMost(120)
+                val top = item.offset + dragOffsetY
+                val bottom = top + item.size
+                val delta = when {
+                    top < info.viewportStartOffset + edge -> -QUEUE_EDGE_SCROLL_STEP
+                    bottom > info.viewportEndOffset - edge -> QUEUE_EDGE_SCROLL_STEP
+                    else -> 0f
+                }
+                if (delta != 0f) {
+                    val consumed = listState.scrollBy(delta)
+                    dragOffsetY += consumed
+                    trySwap()
+                }
+            }
+            delay(16)
+        }
+    }
+
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
     ) {
-        itemsIndexed(items = items, key = { _, item -> item.song.id }) { index, item ->
+        itemsIndexed(items = items, key = { _, item -> item.id }) { index, item ->
             val liveIndex by rememberUpdatedState(index)
             val isDragging = index == draggingIndex
-            val isCurrent = item.song.id == playingSongId
+            val isCurrent = item.id == playingSongId
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -365,11 +454,11 @@ private fun DraggableQueueList(
                     .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                SongArtwork(uri = item.song.uri, size = 44.dp)
+                SongArtwork(uri = item.uri, size = 44.dp)
                 Spacer(Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = item.song.title,
+                        text = item.title,
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
                         color = if (isCurrent) {
@@ -381,7 +470,7 @@ private fun DraggableQueueList(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = item.song.artist ?: "Unknown artist",
+                        text = item.artist ?: "Unknown artist",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -425,19 +514,7 @@ private fun DraggableQueueList(
                                 onDrag = { change, dragAmount ->
                                     change.consume()
                                     dragOffsetY += dragAmount.y
-                                    val cur = draggingIndex ?: return@detectDragGesturesAfterLongPress
-                                    val height = listState.layoutInfo.visibleItemsInfo
-                                        .find { it.index == cur }?.size ?: 0
-                                    if (height <= 0) return@detectDragGesturesAfterLongPress
-                                    if (dragOffsetY > height / 2 && cur < items.lastIndex) {
-                                        items.add(cur + 1, items.removeAt(cur))
-                                        draggingIndex = cur + 1
-                                        dragOffsetY -= height
-                                    } else if (dragOffsetY < -height / 2 && cur > 0) {
-                                        items.add(cur - 1, items.removeAt(cur))
-                                        draggingIndex = cur - 1
-                                        dragOffsetY += height
-                                    }
+                                    trySwap()
                                 },
                             )
                         },

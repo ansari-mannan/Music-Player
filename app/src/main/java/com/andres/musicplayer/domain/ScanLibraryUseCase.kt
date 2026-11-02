@@ -2,12 +2,11 @@ package com.andres.musicplayer.domain
 
 import android.net.Uri
 import com.andres.musicplayer.data.SongRepository
-import com.andres.musicplayer.data.local.entity.Tag
 import com.andres.musicplayer.data.scan.MediaScanner
 
 /**
- * Scans the watched folder for new MP3s, adds them to the library as untagged
- * songs, and removes library entries whose files have disappeared from the tree.
+ * Scans the watched folder for new MP3s, adds them to the library, and removes
+ * library entries whose files have disappeared from the tree.
  * Returns a small summary for the UI to show.
  */
 class ScanLibraryUseCase(
@@ -57,26 +56,10 @@ class ScanLibraryUseCase(
                 autoPlaylisted += entries.size
             }
 
-        // Restore moods that were written into the files (e.g. recovered after a DB wipe).
-        val tagIdByName = HashMap<String, Long>()
-        insertedPairs
-            .filter { it.first.moods.isNotEmpty() }
-            .forEach { (scanned, songId) ->
-                scanned.moods.forEach { moodName ->
-                    val tagId = tagIdByName.getOrPut(moodName) {
-                        repository.getTagByName(moodName)?.id
-                            ?: repository.insertTag(Tag(name = moodName)).takeIf { it != -1L }
-                            ?: repository.getTagByName(moodName)?.id
-                            ?: -1L
-                    }
-                    if (tagId != -1L) repository.tagSong(songId, tagId)
-                }
-            }
-
         return Summary(
             added = newScanned.size,
             removed = orphanIds.size,
-            totalFound = result.totalMp3Found,
+            totalFound = result.totalAudioFound,
             autoPlaylisted = autoPlaylisted,
         )
     }
