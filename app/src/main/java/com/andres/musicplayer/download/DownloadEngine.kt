@@ -1,11 +1,13 @@
 package com.andres.musicplayer.download
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import com.andres.musicplayer.data.local.AppDatabase
@@ -15,6 +17,7 @@ import com.andres.musicplayer.data.local.entity.DownloadEntry
 import com.andres.musicplayer.data.local.entity.DownloadEntryWithSource
 import com.andres.musicplayer.data.local.entity.DownloadState
 import com.andres.musicplayer.data.local.entity.DownloadedVideo
+import com.andres.musicplayer.data.local.entity.Song
 import com.andres.musicplayer.data.prefs.DownloadPreferences
 import com.andres.musicplayer.data.prefs.FolderPreferences
 import com.andres.musicplayer.data.tags.Mp4Tag
@@ -26,6 +29,8 @@ import com.andres.musicplayer.data.youtube.StreamResolutionException
 import com.andres.musicplayer.data.youtube.StreamResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -92,6 +97,8 @@ class DownloadEngine(
     private val metadataResolver: MetadataResolver = MusicMetadataResolver(),
     /** Injected so the pool can be tested without a live foreground service. */
     private val startService: () -> Unit = { DownloadService.ensureRunning(appContext) },
+    /** Puts a finished download into the song library. */
+    private val addToLibrary: suspend (Song) -> Unit = {},
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val http = OkHttpClient.Builder()
@@ -317,6 +324,7 @@ class DownloadEngine(
         val entry = downloadDao.getById(id) ?: return
         var written = entry.bytesDownloaded
         var total = entry.totalBytes
+        var metadata: Deferred<TrackMetadata?>? = null
         try {
             downloadDao.updateState(id, DownloadState.DOWNLOADING)
 
@@ -325,6 +333,11 @@ class DownloadEngine(
             val stream = resolver.resolve(entry.videoId)
             // A hand-started download only knows the video id until this point.
             if (entry.title != stream.title) downloadDao.updateTitle(id, stream.title)
+
+            // Tags and cover art come from other servers and don't depend on the audio,
+            // so they are fetched alongside it rather than after it. A child of this job:
+            // a pause or cancel stops it too.
+            metadata = CoroutineScope(coroutineContext).async { prepareMetadata(id, entry, stream) }
 
             val part = partFile(id)
             part.parentFile?.mkdirs()
@@ -428,7 +441,7 @@ class DownloadEngine(
                 throw IOException("Download ended early ($written of $total bytes).")
             }
 
-            finish(id, entry, part, stream, written, total)
+            finish(id, entry, part, stream, written, total, metadata.await())
         } catch (cancellation: CancellationException) {
             withContext(NonCancellable) { handleStop(id, written, total) }
             throw cancellation
@@ -438,6 +451,9 @@ class DownloadEngine(
             downloadDao.updateState(id, DownloadState.QUEUED)
         } catch (e: Exception) {
             withContext(NonCancellable) { handleFailure(id, written, total, e) }
+        } finally {
+            // Nothing to wait for once the download itself has failed or stopped.
+            metadata?.cancel()
         }
     }
 
@@ -455,20 +471,18 @@ class DownloadEngine(
         stream: ResolvedStream,
         written: Long,
         total: Long?,
+        metadata: TrackMetadata?,
     ) {
         val folder = watchedFolder()
             ?: throw IOException("No music folder chosen — pick one in Settings first.")
         val extension = stream.fileExtension
         val title = stream.title
 
-        // Worked out before the music folder is touched, so the library scanner only ever
-        // sees the finished file, art and all.
-        val metadata = prepareMetadata(id, entry, stream)
-
         val fileName = "${sanitiseFileName(title.ifBlank { entry.videoId })}.$extension"
         val (destination, hasArt) =
             writeIntoWatchedFolder(Uri.parse(folder), fileName, part, extension, entry.videoId, metadata)
 
+        val durationMs = durationOf(part)
         part.delete()
         downloadedVideoDao.insert(
             DownloadedVideo(
@@ -483,6 +497,37 @@ class DownloadEngine(
         downloadDao.setHasEmbeddedArt(id, hasArt)
         downloadDao.markCompleted(id)
         clearProgress(id)
+
+        // Straight into the library, so a finished download is playable now rather than
+        // after the next launch's scan. That scan then sees the uri as known and skips it.
+        try {
+            addToLibrary(
+                Song(
+                    uri = destination,
+                    title = metadata?.tags?.title?.takeIf { it.isNotBlank() } ?: title.ifBlank { entry.videoId },
+                    artist = metadata?.tags?.artist,
+                    album = metadata?.tags?.album,
+                    durationMs = durationMs,
+                ),
+            )
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (e: Exception) {
+            Log.w(TAG, "Couldn't add ${entry.videoId} to the library; the next scan will", e)
+        }
+    }
+
+    /** Track length read from the local copy, which is quicker than going through SAF. */
+    private fun durationOf(file: File): Long {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (_: Exception) {
+            0L
+        } finally {
+            retriever.release()
+        }
     }
 
     /** Tags to write into a finished download. */
@@ -661,10 +706,13 @@ class DownloadEngine(
             ?: throw IOException("Music folder is no longer accessible.")
         if (!tree.canWrite()) throw IOException("No permission to write to the music folder.")
 
+        // One listing of the folder's names. `findFile` lists the whole folder through the
+        // provider on every call, and this loop could call it several times per download.
+        val taken = existingNames(treeUri)
         val base = fileName.substringBeforeLast('.', fileName)
         var candidate = fileName
         var suffix = 1
-        while (tree.findFile(candidate) != null) {
+        while (candidate in taken) {
             candidate = "$base ($suffix).$extension"
             suffix++
         }
@@ -713,6 +761,25 @@ class DownloadEngine(
             runCatching { target.delete() }
             throw e
         }
+    }
+
+    /** Every file name directly inside the watched folder. */
+    private fun existingNames(treeUri: Uri): Set<String> {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri),
+        )
+        val names = HashSet<String>()
+        appContext.contentResolver.query(
+            children,
+            arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            while (cursor.moveToNext()) cursor.getString(0)?.let { names += it }
+        }
+        return names
     }
 
     private fun mimeFor(extension: String) = when (extension.lowercase()) {
@@ -769,6 +836,7 @@ class DownloadEngine(
                 // tab both reach this engine rather than each nudging a private copy.
                 concurrency = DownloadPreferences(context).concurrency,
                 watchedFolder = { folderPrefs.watchedFolderUri },
+                addToLibrary = { song -> db.songDao().insert(song) },
             )
         }
     }
