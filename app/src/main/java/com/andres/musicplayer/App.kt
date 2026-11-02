@@ -13,6 +13,7 @@ import com.andres.musicplayer.download.PlaylistSyncWorker
 import com.andres.musicplayer.playback.AudioEffects
 import com.andres.musicplayer.ui.art.AudioArt
 import com.andres.musicplayer.ui.art.AudioArtFetcher
+import com.andres.musicplayer.ui.art.ArtworkVersion
 
 /** Registers the embedded-art fetcher so Coil can load cover art app-wide. */
 class App : Application(), SingletonImageLoader.Factory {
@@ -42,6 +43,8 @@ class App : Application(), SingletonImageLoader.Factory {
         super.onCreate()
         // Make saved audio-effect settings available before playback attaches effects.
         AudioEffects.init(this)
+        // Before any cover loads: the art cache keys on this persisted counter.
+        ArtworkVersion.init(this)
         // Re-apply the periodic sync schedule. Cheap and idempotent — WorkManager keeps
         // the existing schedule when the interval hasn't changed.
         PlaylistSyncWorker.schedule(this)
@@ -51,6 +54,7 @@ class App : Application(), SingletonImageLoader.Factory {
         ImageLoader.Builder(context)
             .components {
                 add(AudioArtFetcher.Factory(this@App), AudioArt::class)
+                add(AudioArtFetcher.Keyer(), AudioArt::class)
                 // Coil 3 ships no network stack of its own; without this, remote URLs
                 // (YouTube playlist thumbnails) silently fail to load.
                 add(OkHttpNetworkFetcherFactory())
