@@ -213,11 +213,12 @@ fun AppRoot(settings: SettingsState) {
             val result = repo.syncAllMetadataToFiles()
             // Opus/WebM/FLAC have no tag writer here, so say so rather than quietly
             // reporting a smaller number than the library size.
-            val message = if (result.skipped > 0) {
-                "Saved song info into ${result.written} files. " +
-                    "${result.skipped} skipped (unsupported format or read-only)."
-            } else {
-                "Saved song info into ${result.written} files."
+            val message = buildString {
+                append("Saved song info into ${result.written} files.")
+                if (result.unchanged > 0) append(" ${result.unchanged} already up to date.")
+                if (result.skipped > 0) {
+                    append(" ${result.skipped} skipped (unsupported format or read-only).")
+                }
             }
             snackbarHostState.showSnackbar(message)
         }

@@ -103,11 +103,18 @@ class SongRepository(
         )
     }
 
-    /** Outcome of a bulk metadata write: how many files took it, and how many couldn't. */
-    data class MetadataSyncResult(val written: Int, val skipped: Int)
+    /**
+     * Outcome of a bulk metadata write: how many files took it, how many already matched
+     * and were left alone, and how many couldn't be written.
+     */
+    data class MetadataSyncResult(val written: Int, val unchanged: Int, val skipped: Int)
 
     /**
      * Writes every song's info into its file. Reports progress as (done, total).
+     *
+     * Files whose tags already say what the library says are not touched. A tag write
+     * rewrites the whole file through SAF, so rewriting an unchanged library was megabytes
+     * of storage wear per song for nothing; reading the tags back only touches the header.
      *
      * [MetadataSyncResult.skipped] counts songs whose container has no tag writer
      * (Opus/WebM/FLAC) or whose file rejected the write, so the UI can say so instead of
@@ -118,18 +125,44 @@ class SongRepository(
     ): MetadataSyncResult = withContext(Dispatchers.IO) {
         val all = songDao.getAllOnce().filter { it.uri.contains("/document/") }
         var written = 0
+        var unchanged = 0
         all.forEachIndexed { index, song ->
-            val ok = AudioTags.writeTags(
-                context = appContext,
-                uriString = song.uri,
-                title = song.title,
-                artist = song.artist,
-                album = song.album,
-            )
-            if (ok) written++
+            if (fileTagsMatch(song)) {
+                unchanged++
+            } else {
+                val ok = AudioTags.writeTags(
+                    context = appContext,
+                    uriString = song.uri,
+                    title = song.title,
+                    artist = song.artist,
+                    album = song.album,
+                )
+                if (ok) written++
+            }
             onProgress(index + 1, all.size)
         }
-        MetadataSyncResult(written = written, skipped = all.size - written)
+        MetadataSyncResult(
+            written = written,
+            unchanged = unchanged,
+            skipped = all.size - written - unchanged,
+        )
+    }
+
+    /** True when the file's own title/artist/album already equal the library's. */
+    private fun fileTagsMatch(song: Song): Boolean {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(appContext, Uri.parse(song.uri))
+            fun read(key: Int) = retriever.extractMetadata(key)?.trim().orEmpty()
+            read(MediaMetadataRetriever.METADATA_KEY_TITLE) == song.title.trim() &&
+                read(MediaMetadataRetriever.METADATA_KEY_ARTIST) == song.artist?.trim().orEmpty() &&
+                read(MediaMetadataRetriever.METADATA_KEY_ALBUM) == song.album?.trim().orEmpty()
+        } catch (_: Exception) {
+            // Unreadable here means "unknown", and an unknown file gets the write.
+            false
+        } finally {
+            retriever.release()
+        }
     }
 
     /**
