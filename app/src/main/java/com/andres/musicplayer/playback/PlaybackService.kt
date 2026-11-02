@@ -8,6 +8,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
@@ -61,16 +62,18 @@ class PlaybackService : MediaSessionService() {
         // Restore the queue + position saved before the last process death (paused).
         restorePlaybackState(player)
 
-        // Persist on meaningful changes, plus a periodic tick so abrupt death loses
-        // at most a few seconds of position.
+        // The queue is saved whole only when it changes; everything else just moves the
+        // saved position. The tick runs only while playing — a paused player's position
+        // can't drift, and the pause itself was already saved.
         player.addListener(object : Player.Listener {
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = savePlaybackState(player)
-            override fun onIsPlayingChanged(isPlaying: Boolean) = savePlaybackState(player)
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) = savePlaybackState(player)
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = savePosition(player)
+            override fun onIsPlayingChanged(isPlaying: Boolean) = savePosition(player)
         })
         serviceScope.launch {
             while (isActive) {
                 delay(SAVE_INTERVAL_MS)
-                savePlaybackState(player)
+                if (player.isPlaying) savePosition(player)
             }
         }
 
@@ -99,6 +102,14 @@ class PlaybackService : MediaSessionService() {
             player.playWhenReady = false
             player.prepare()
         }
+    }
+
+    private fun savePosition(player: ExoPlayer) {
+        if (player.mediaItemCount == 0) return
+        playbackPrefs.savePosition(
+            index = player.currentMediaItemIndex.coerceAtLeast(0),
+            positionMs = player.currentPosition.coerceAtLeast(0L),
+        )
     }
 
     private fun savePlaybackState(player: ExoPlayer) {
