@@ -105,6 +105,16 @@ class PlayerState(context: Context) {
         override fun onEvents(player: Player, events: Player.Events) {
             isPlaying = player.isPlaying
             durationMs = player.duration.coerceAtLeast(0L)
+            // The ticker below only runs while playing; a seek or track change while
+            // paused would otherwise leave the bar showing the old position.
+            if (events.containsAny(
+                    Player.EVENT_POSITION_DISCONTINUITY,
+                    Player.EVENT_MEDIA_ITEM_TRANSITION,
+                    Player.EVENT_PLAYBACK_STATE_CHANGED,
+                )
+            ) {
+                positionMs = player.currentPosition.coerceAtLeast(0L)
+            }
             repeatMode = player.repeatMode
             speed = player.playbackParameters.speed
             val index = player.currentMediaItemIndex.coerceAtLeast(0)
@@ -436,8 +446,12 @@ class PlayerState(context: Context) {
 
     // ----------------------------------------------------------- transport
 
+    /**
+     * Keyed on [Player.getPlayWhenReady], not `isPlaying`: while a track is buffering
+     * `isPlaying` is false, so a tap meant as Pause would call play() and do nothing.
+     */
     fun togglePlayPause() = withController {
-        if (isPlaying) pause() else play()
+        if (playWhenReady) pause() else play()
     }
 
     /** The queue is already in play order, so Next is a plain step forward. */
@@ -476,7 +490,11 @@ class PlayerState(context: Context) {
         if (c.hasPreviousMediaItem()) c.seekToPreviousMediaItem() else c.seekTo(0L)
     }
 
-    fun seekTo(ms: Long) = withController { seekTo(ms) }
+    fun seekTo(ms: Long) {
+        // Moves the bar now rather than snapping back until the next 500 ms tick.
+        positionMs = ms.coerceAtLeast(0L)
+        withController { seekTo(ms) }
+    }
 
     /** Cycles repeat: off → all (loop playlist) → one (loop track) → off. */
     fun cycleRepeat() = withController {

@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
@@ -27,6 +29,11 @@ fun SeekBar(
 ) {
     val activeColor = MaterialTheme.colorScheme.primary
     val inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
+    // The gesture detectors below are installed once and outlive recompositions, so they
+    // must read the latest callbacks: the caller's lambdas capture the track's duration,
+    // and a stale one seeks the next song using the previous song's length.
+    val scrub by rememberUpdatedState(onScrub)
+    val scrubFinished by rememberUpdatedState(onScrubFinished)
 
     Canvas(
         modifier = modifier
@@ -35,21 +42,21 @@ fun SeekBar(
             .pointerInput(Unit) {
                 val r = 7.dp.toPx()
                 detectTapGestures { offset ->
-                    onScrub(((offset.x - r) / (size.width - 2 * r)).coerceIn(0f, 1f))
-                    onScrubFinished()
+                    scrub(((offset.x - r) / (size.width - 2 * r)).coerceIn(0f, 1f))
+                    scrubFinished()
                 }
             }
             .pointerInput(Unit) {
                 val r = 7.dp.toPx()
                 detectHorizontalDragGestures(
                     onDragStart = { offset ->
-                        onScrub(((offset.x - r) / (size.width - 2 * r)).coerceIn(0f, 1f))
+                        scrub(((offset.x - r) / (size.width - 2 * r)).coerceIn(0f, 1f))
                     },
                     onHorizontalDrag = { change, _ ->
-                        onScrub(((change.position.x - r) / (size.width - 2 * r)).coerceIn(0f, 1f))
+                        scrub(((change.position.x - r) / (size.width - 2 * r)).coerceIn(0f, 1f))
                     },
-                    onDragEnd = { onScrubFinished() },
-                    onDragCancel = { onScrubFinished() },
+                    onDragEnd = { scrubFinished() },
+                    onDragCancel = { scrubFinished() },
                 )
             },
     ) {
