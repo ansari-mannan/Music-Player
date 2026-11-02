@@ -14,6 +14,8 @@ import coil3.fetch.FetchResult
 import coil3.fetch.Fetcher
 import coil3.fetch.ImageFetchResult
 import coil3.request.Options
+import coil3.size.Size
+import coil3.size.pxOrElse
 
 /**
  * Coil model: "load the embedded cover art of this audio file".
@@ -41,6 +43,7 @@ object ArtworkVersion {
 class AudioArtFetcher(
     private val data: AudioArt,
     private val context: Context,
+    private val options: Options,
 ) : Fetcher {
 
     override suspend fun fetch(): FetchResult? {
@@ -48,10 +51,20 @@ class AudioArtFetcher(
         return try {
             retriever.setDataSource(context, data.uri)
             val bytes = retriever.embeddedPicture ?: return null
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+            // Decode near the size actually drawn: a full 720px+ cover per 44dp list row
+            // thrashes Coil's memory cache and costs ~2 MB of heap per visible row.
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            val sampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, options.size)
+            val bitmap = BitmapFactory.decodeByteArray(
+                bytes,
+                0,
+                bytes.size,
+                BitmapFactory.Options().apply { inSampleSize = sampleSize },
+            ) ?: return null
             ImageFetchResult(
                 image = bitmap.asImage(),
-                isSampled = false,
+                isSampled = sampleSize > 1,
                 dataSource = DataSource.DISK,
             )
         } catch (_: Exception) {
@@ -63,6 +76,21 @@ class AudioArtFetcher(
 
     class Factory(private val context: Context) : Fetcher.Factory<AudioArt> {
         override fun create(data: AudioArt, options: Options, imageLoader: ImageLoader): Fetcher =
-            AudioArtFetcher(data, context.applicationContext)
+            AudioArtFetcher(data, context.applicationContext, options)
     }
+}
+
+/**
+ * Largest power-of-two downsample that keeps the image at least as big as the requested
+ * [size] on both axes, so the crop to the tile never upscales. 1 when the size is unknown.
+ */
+private fun sampleSizeFor(width: Int, height: Int, size: Size): Int {
+    val targetWidth = size.width.pxOrElse { 0 }
+    val targetHeight = size.height.pxOrElse { 0 }
+    if (width <= 0 || height <= 0 || targetWidth <= 0 || targetHeight <= 0) return 1
+    var sample = 1
+    while (width / (sample * 2) >= targetWidth && height / (sample * 2) >= targetHeight) {
+        sample *= 2
+    }
+    return sample
 }
