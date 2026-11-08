@@ -11,6 +11,8 @@ import com.andres.musicplayer.data.youtube.YouTubeRepository
 import com.andres.musicplayer.download.DownloadEngine
 import com.andres.musicplayer.download.PlaylistSyncWorker
 import com.andres.musicplayer.playback.AudioEffects
+import com.andres.musicplayer.playback.PlaybackPrefs
+import com.andres.musicplayer.playback.SleepTimer
 import com.andres.musicplayer.ui.art.AudioArt
 import com.andres.musicplayer.ui.art.AudioArtFetcher
 import com.andres.musicplayer.ui.art.ArtworkVersion
@@ -43,6 +45,8 @@ class App : Application(), SingletonImageLoader.Factory {
         super.onCreate()
         // Make saved audio-effect settings available before playback attaches effects.
         AudioEffects.init(this)
+        PlaybackPrefs.init(this)
+        SleepTimer.init(this)
         // Before any cover loads: the art cache keys on this persisted counter.
         ArtworkVersion.init(this)
         // Re-apply the periodic sync schedule. Cheap and idempotent — WorkManager keeps

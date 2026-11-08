@@ -2,7 +2,8 @@ package com.andres.musicplayer.ui.player
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +23,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -54,6 +56,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -63,6 +66,7 @@ import androidx.media3.common.Player
 import com.andres.musicplayer.ui.art.SongArtwork
 import com.andres.musicplayer.ui.art.SongArtworkGlow
 import com.andres.musicplayer.ui.common.EmptyState
+import com.andres.musicplayer.ui.common.LocalSongActions
 import com.andres.musicplayer.ui.songs.EditInfoDialog
 import com.andres.musicplayer.ui.util.ArtSaveRequest
 import com.andres.musicplayer.ui.util.formatDuration
@@ -80,10 +84,11 @@ fun NowPlayingScreen(
     player: PlayerState,
     onBack: () -> Unit,
     onSaveInfo: (id: Long, title: String, artist: String?, album: String?) -> Unit,
-    onChangeArtwork: (id: Long, imageUri: android.net.Uri) -> Unit,
+    onChangeArtwork: suspend (id: Long, imageUri: android.net.Uri) -> Boolean,
     modifier: Modifier = Modifier,
 ) {
     val current = player.current
+    val songActions = LocalSongActions.current
     val mono = rememberMonoController()
     val saveArtwork = rememberArtworkSaver()
 
@@ -113,7 +118,21 @@ fun NowPlayingScreen(
         return
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    val collapseThresholdPx = with(LocalDensity.current) { 120.dp.toPx() }
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            // Swipe down anywhere to collapse, like most players. Horizontal gestures
+            // (artwork swipe, seek bar) claim their drags first, so they're unaffected.
+            .pointerInput(Unit) {
+                var totalDy = 0f
+                detectVerticalDragGestures(
+                    onDragStart = { totalDy = 0f },
+                    onVerticalDrag = { _, dy -> totalDy += dy },
+                    onDragEnd = { if (totalDy > collapseThresholdPx) onBack() },
+                )
+            },
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -136,15 +155,14 @@ fun NowPlayingScreen(
                             color = MaterialTheme.colorScheme.primary,
                         )
                     }
+                    IconButton(onClick = { showQueueSheet = true }) {
+                        Icon(Icons.AutoMirrored.Filled.QueueMusic, contentDescription = "Up next")
+                    }
                     Box {
                         IconButton(onClick = { menuOpen = true }) {
                             Icon(Icons.Default.MoreVert, contentDescription = "More")
                         }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Up next") },
-                            onClick = { menuOpen = false; showQueueSheet = true },
-                        )
                         DropdownMenuItem(
                             text = { Text("Playback speed") },
                             onClick = { menuOpen = false; showSpeedDialog = true },
@@ -168,6 +186,12 @@ fun NowPlayingScreen(
                             text = { Text("Edit info") },
                             onClick = { menuOpen = false; showEditDialog = true },
                         )
+                        if (current.id > 0) {
+                            DropdownMenuItem(
+                                text = { Text("Trim / cut") },
+                                onClick = { menuOpen = false; songActions.openTrim(current) },
+                            )
+                        }
                         }
                     }
                 }
@@ -270,7 +294,7 @@ fun NowPlayingScreen(
                     onClick = { player.togglePlayPause() },
                     modifier = Modifier.size(72.dp),
                 ) {
-                    if (player.isPlaying) PauseIcon(Modifier.size(30.dp)) else PlayIcon(Modifier.size(30.dp))
+                    if (player.showPlayButton) PlayIcon(Modifier.size(30.dp)) else PauseIcon(Modifier.size(30.dp))
                 }
                 IconButton(onClick = { player.next() }, modifier = Modifier.size(56.dp)) {
                     SkipNextIcon(Modifier.size(30.dp))
@@ -310,7 +334,8 @@ fun NowPlayingScreen(
         OptionDialog(
             title = "Sleep timer",
             options = sleepOptions,
-            isSelected = { it.minutes == player.sleepTimerMinutes },
+            isSelected = { it.minutes == player.sleepTimerMinutes ||
+                (it.minutes == null && player.sleepTimerMinutes == null) },
             label = { it.label },
             onSelect = { player.setSleepTimer(it.minutes); showSleepDialog = false },
             onDismiss = { showSleepDialog = false },
@@ -357,6 +382,7 @@ private fun QueueSheet(player: PlayerState, onDismiss: () -> Unit) {
             DraggableQueueList(
                 queue = queue,
                 playingSongId = playingSongId,
+                currentIndex = player.currentIndex,
                 onTap = { player.playQueueItem(it) },
                 onRemove = { player.removeFromQueue(it) },
                 onMove = { from, to -> player.moveQueueItem(from, to) },
@@ -374,13 +400,17 @@ private fun QueueSheet(player: PlayerState, onDismiss: () -> Unit) {
 private fun DraggableQueueList(
     queue: List<com.andres.musicplayer.data.local.entity.Song>,
     playingSongId: Long?,
+    currentIndex: Int,
     onTap: (Int) -> Unit,
     onRemove: (Int) -> Unit,
     onMove: (from: Int, to: Int) -> Unit,
 ) {
-    val listState = rememberLazyListState()
+    // Opens on the playing song, with a little of what came before above it.
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = (currentIndex - 1).coerceAtLeast(0))
     // Local working copy, rebuilt whenever the real queue changes (e.g. after a commit).
-    val items = remember(queue) { queue.toMutableStateList() }
+    // Each row carries its original position as its key: the same song can be queued
+    // twice, and two rows sharing a key crashed the list.
+    val items = remember(queue) { queue.mapIndexed { i, song -> QueueRow(i, song) }.toMutableStateList() }
     var draggingIndex by remember { mutableStateOf<Int?>(null) }
     var startIndex by remember { mutableStateOf<Int?>(null) }
     var dragOffsetY by remember { mutableStateOf(0f) }
@@ -431,10 +461,11 @@ private fun DraggableQueueList(
         state = listState,
         modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
     ) {
-        itemsIndexed(items = items, key = { _, item -> item.id }) { index, item ->
+        itemsIndexed(items = items, key = { _, row -> row.key }) { index, row ->
+            val item = row.song
             val liveIndex by rememberUpdatedState(index)
             val isDragging = index == draggingIndex
-            val isCurrent = item.id == playingSongId
+            val isCurrent = row.key == currentIndex && item.id == playingSongId
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -492,7 +523,8 @@ private fun DraggableQueueList(
                         .size(40.dp)
                         .padding(8.dp)
                         .pointerInput(Unit) {
-                            detectDragGesturesAfterLongPress(
+                            // The handle exists only to drag, so it starts immediately.
+                            detectDragGestures(
                                 onDragStart = {
                                     draggingIndex = liveIndex
                                     startIndex = liveIndex
@@ -523,6 +555,9 @@ private fun DraggableQueueList(
         }
     }
 }
+
+/** A queue entry plus a key that stays unique even when a song is queued twice. */
+private data class QueueRow(val key: Int, val song: com.andres.musicplayer.data.local.entity.Song)
 
 private data class SpeedOption(val label: String, val value: Float)
 

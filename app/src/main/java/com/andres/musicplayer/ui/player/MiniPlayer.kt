@@ -101,10 +101,10 @@ fun MiniPlayer(
                     )
                 }
                 FilledIconButton(onClick = { player.togglePlayPause() }) {
-                    if (player.isPlaying) {
-                        PauseIcon(Modifier.size(20.dp))
-                    } else {
+                    if (player.showPlayButton) {
                         PlayIcon(Modifier.size(20.dp))
+                    } else {
+                        PauseIcon(Modifier.size(20.dp))
                     }
                 }
                 IconButton(onClick = { player.next() }) {
