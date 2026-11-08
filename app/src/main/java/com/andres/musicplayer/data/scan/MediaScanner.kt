@@ -30,6 +30,12 @@ class MediaScanner(private val context: Context) {
         val totalAudioFound: Int,
         /** Every audio uri found in the tree (used to detect deleted/orphaned files). */
         val allFoundUris: List<String>,
+        /**
+         * False when any folder in the tree couldn't be listed (permission lost, SD card
+         * removed, provider error). A partial listing says nothing about which songs are
+         * gone, so the caller must not remove anything on the strength of it.
+         */
+        val complete: Boolean = true,
     )
 
     /**
@@ -45,11 +51,16 @@ class MediaScanner(private val context: Context) {
     ): Result =
         withContext(Dispatchers.IO) {
             val rootId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
-                ?: return@withContext Result(emptyList(), totalAudioFound = 0, allFoundUris = emptyList())
+                ?: return@withContext Result(
+                    emptyList(),
+                    totalAudioFound = 0,
+                    allFoundUris = emptyList(),
+                    complete = false,
+                )
 
             val audioFiles = mutableListOf<FoundFile>()
             // Start at the root with no subfolder; it's set once when descending one level.
-            collectAudioFiles(treeUri, rootId, subfolder = null, out = audioFiles)
+            val complete = collectAudioFiles(treeUri, rootId, subfolder = null, out = audioFiles)
 
             val total = audioFiles.size
             onProgress(0, total)
@@ -77,6 +88,7 @@ class MediaScanner(private val context: Context) {
                 newSongs = newSongs,
                 totalAudioFound = allFoundUris.size,
                 allFoundUris = allFoundUris,
+                complete = complete,
             )
         }
 
@@ -91,18 +103,21 @@ class MediaScanner(private val context: Context) {
      *
      * Uris are built exactly as `DocumentFile` builds them (tree uri + document id), so
      * they match the ones already stored in the library.
+     *
+     * Returns false if any folder in the tree couldn't be listed.
      */
     private fun collectAudioFiles(
         treeUri: Uri,
         parentId: String,
         subfolder: String?,
         out: MutableList<FoundFile>,
-    ) {
+    ): Boolean {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
         val folders = mutableListOf<Pair<String, String>>()
-        runCatching {
+        val cursor = runCatching {
             context.contentResolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
-        }.getOrNull()?.use { cursor ->
+        }.getOrNull() ?: return false
+        cursor.use { cursor ->
             while (cursor.moveToNext()) {
                 val id = cursor.getString(0) ?: continue
                 val name = cursor.getString(1).orEmpty()
@@ -118,7 +133,11 @@ class MediaScanner(private val context: Context) {
             }
         }
         // First descent from root sets the subfolder; deeper levels keep it.
-        folders.forEach { (id, name) -> collectAudioFiles(treeUri, id, subfolder ?: name, out) }
+        var complete = true
+        folders.forEach { (id, name) ->
+            if (!collectAudioFiles(treeUri, id, subfolder ?: name, out)) complete = false
+        }
+        return complete
     }
 
     private fun isSupportedAudio(name: String, mime: String): Boolean {

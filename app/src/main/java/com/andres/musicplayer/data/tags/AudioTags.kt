@@ -34,26 +34,35 @@ object AudioTags {
         album: String? = null,
         artwork: ByteArray? = null,
         artworkMime: String? = null,
-    ): Boolean = when (formatOf(context, uriString)) {
-        Format.ID3 -> Id3Tag.writeTags(
-            context = context,
-            uriString = uriString,
-            title = title,
-            artist = artist,
-            album = album,
-            artwork = artwork,
-            artworkMime = artworkMime,
-        )
-        Format.MP4 -> Mp4Tag.writeTags(
-            context = context,
-            uriString = uriString,
-            title = title,
-            artist = artist,
-            album = album,
-            artwork = artwork,
-            artworkMime = artworkMime,
-        )
-        Format.UNSUPPORTED -> false
+    ): Boolean {
+        if (title == null && artist == null && album == null && artwork == null) return true
+        val format = formatOf(context, uriString)
+        if (format == Format.UNSUPPORTED) return false
+        // Every in-place rewrite goes through SafeRewrite, so a crash mid-write costs the
+        // edit, never the song.
+        return SafeRewrite.run(context, uriString) {
+            when (format) {
+                Format.ID3 -> Id3Tag.writeTags(
+                    context = context,
+                    uriString = uriString,
+                    title = title,
+                    artist = artist,
+                    album = album,
+                    artwork = artwork,
+                    artworkMime = artworkMime,
+                )
+                Format.MP4 -> Mp4Tag.writeTags(
+                    context = context,
+                    uriString = uriString,
+                    title = title,
+                    artist = artist,
+                    album = album,
+                    artwork = artwork,
+                    artworkMime = artworkMime,
+                )
+                Format.UNSUPPORTED -> false
+            }
+        }
     }
 
     private enum class Format { ID3, MP4, UNSUPPORTED }

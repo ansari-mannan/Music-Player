@@ -27,6 +27,30 @@ interface PlaylistDao {
     @Query("SELECT * FROM playlists ORDER BY createdAt DESC")
     fun getAllWithSongs(): Flow<List<PlaylistWithSongs>>
 
+    /**
+     * Playlists for list views: name, song count and the first four covers, without
+     * loading every song of every playlist. Covers are joined with a unit separator
+     * (char 31), which can't appear in a uri.
+     */
+    @Query(
+        "SELECT p.id AS id, p.name AS name, " +
+            "(SELECT COUNT(*) FROM playlist_song_cross_ref r WHERE r.playlistId = p.id) AS songCount, " +
+            "(SELECT group_concat(uri, char(31)) FROM (SELECT s.uri AS uri FROM playlist_song_cross_ref r2 " +
+            "INNER JOIN songs s ON s.id = r2.songId WHERE r2.playlistId = p.id " +
+            "ORDER BY r2.addedAt ASC LIMIT 4)) AS coverUris " +
+            "FROM playlists p ORDER BY p.createdAt DESC",
+    )
+    fun getSummaries(): Flow<List<PlaylistSummary>>
+
+    /** Insertion order of the last song, so new songs land after a reordered list. */
+    @Query("SELECT COALESCE(MAX(addedAt), 0) FROM playlist_song_cross_ref WHERE playlistId = :playlistId")
+    suspend fun maxAddedAt(playlistId: Long): Long
+
+    @Transaction
+    suspend fun reorder(playlistId: Long, orderedSongIds: List<Long>) {
+        orderedSongIds.forEachIndexed { index, songId -> updateAddedAt(playlistId, songId, index.toLong()) }
+    }
+
     @Query("SELECT * FROM playlists WHERE id = :id")
     fun getPlaylist(id: Long): Flow<Playlist?>
 
@@ -53,4 +77,18 @@ interface PlaylistDao {
             "ORDER BY playlist_song_cross_ref.addedAt ASC",
     )
     fun songsInPlaylist(playlistId: Long): Flow<List<Song>>
+}
+
+/** A playlist row for list views (see [PlaylistDao.getSummaries]). */
+data class PlaylistSummary(
+    val id: Long,
+    val name: String,
+    val songCount: Int,
+    val coverUris: String?,
+) {
+    val covers: List<String> get() = coverUris?.split(SEPARATOR)?.filter { it.isNotBlank() }.orEmpty()
+
+    private companion object {
+        val SEPARATOR = 31.toChar()
+    }
 }

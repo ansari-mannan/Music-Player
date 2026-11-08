@@ -9,11 +9,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.room.TypeConverters
 import com.andres.musicplayer.data.local.dao.DownloadDao
 import com.andres.musicplayer.data.local.dao.DownloadedVideoDao
+import com.andres.musicplayer.data.local.dao.ExclusionDao
 import com.andres.musicplayer.data.local.dao.PlaylistDao
 import com.andres.musicplayer.data.local.dao.SongDao
 import com.andres.musicplayer.data.local.dao.WatchedPlaylistDao
 import com.andres.musicplayer.data.local.entity.DownloadEntry
 import com.andres.musicplayer.data.local.entity.DownloadedVideo
+import com.andres.musicplayer.data.local.entity.ExcludedSong
+import com.andres.musicplayer.data.local.entity.IgnoredVideo
 import com.andres.musicplayer.data.local.entity.Playlist
 import com.andres.musicplayer.data.local.entity.PlaylistSongCrossRef
 import com.andres.musicplayer.data.local.entity.Song
@@ -27,8 +30,10 @@ import com.andres.musicplayer.data.local.entity.WatchedPlaylist
         WatchedPlaylist::class,
         DownloadEntry::class,
         DownloadedVideo::class,
+        ExcludedSong::class,
+        IgnoredVideo::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -38,6 +43,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
     abstract fun watchedPlaylistDao(): WatchedPlaylistDao
     abstract fun downloadDao(): DownloadDao
+    abstract fun exclusionDao(): ExclusionDao
     abstract fun downloadedVideoDao(): DownloadedVideoDao
 
     companion object {
@@ -216,6 +222,26 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Adds the "removed on purpose" lists: songs deleted from the library (so a scan
+         * doesn't re-add them) and videos cancelled from the download queue (so a sync
+         * doesn't re-queue them). Purely additive.
+         */
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `excluded_songs` " +
+                        "(`uri` TEXT NOT NULL, `documentId` TEXT, " +
+                        "`excludedAt` INTEGER NOT NULL, PRIMARY KEY(`uri`))",
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `ignored_videos` " +
+                        "(`videoId` TEXT NOT NULL, `ignoredAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`videoId`))",
+                )
+            }
+        }
+
         @Volatile
         private var instance: AppDatabase? = null
 
@@ -233,6 +259,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_5_6,
                     MIGRATION_6_7,
                     MIGRATION_7_8,
+                    MIGRATION_8_9,
                 )
                     .build()
                     .also { instance = it }

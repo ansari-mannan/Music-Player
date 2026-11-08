@@ -331,7 +331,11 @@ object Mp4Tag {
             }
         }.getOrNull() ?: false
         if (!needsRepair) return false
+        return SafeRewrite.run(context, uriString) { relayout(context, uri) }
+    }
 
+    private fun relayout(context: Context, uri: Uri): Boolean {
+        val resolver = context.contentResolver
         val working = File.createTempFile("mp4fix", ".tmp", context.cacheDir)
         return try {
             resolver.openInputStream(uri)?.use { input ->

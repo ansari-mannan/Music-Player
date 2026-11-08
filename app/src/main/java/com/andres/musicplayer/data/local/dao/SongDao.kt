@@ -63,6 +63,23 @@ interface SongDao {
 
     @Query("SELECT * FROM songs WHERE id = :id")
     suspend fun getById(id: Long): Song?
+
+    @Query("SELECT * FROM songs WHERE id IN (:ids)")
+    suspend fun getByIds(ids: List<Long>): List<Song>
+
+    @Query("SELECT * FROM songs WHERE uri = :uri LIMIT 1")
+    suspend fun getByUri(uri: String): Song?
+
+    /**
+     * Points an existing song at the file's new uri, keeping its id — and with it every
+     * playlist it's in and every edit made to it. Used when the same file turns up under a
+     * different uri (folder re-picked, or the file moved).
+     */
+    @Query("UPDATE songs SET uri = :uri WHERE id = :id")
+    suspend fun updateUri(id: Long, uri: String)
+
+    @Query("UPDATE songs SET durationMs = :durationMs WHERE id = :id")
+    suspend fun updateDuration(id: Long, durationMs: Long)
 }
 
 /** A library song's id + uri, used to find entries whose files no longer exist. */
