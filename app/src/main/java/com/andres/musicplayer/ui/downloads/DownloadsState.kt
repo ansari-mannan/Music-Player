@@ -41,6 +41,10 @@ class DownloadsState(context: Context) {
     var concurrency by mutableStateOf(prefs.concurrency.value)
         private set
 
+    /** True while queued songs are held back by the Wi-Fi-only setting. */
+    var waitingForWifi by mutableStateOf(false)
+        private set
+
     /** Set when a pasted link couldn't be understood, or the video is already queued. */
     var message by mutableStateOf<String?>(null)
         private set
@@ -51,6 +55,7 @@ class DownloadsState(context: Context) {
         scope.launch { engine.completedEntries.collect { completed = it } }
         scope.launch { engine.progress.collect { progress = it } }
         scope.launch { prefs.concurrency.collect { concurrency = it } }
+        scope.launch { engine.waitingForWifi.collect { waitingForWifi = it } }
     }
 
     /** Accepts a full YouTube link or a bare video id. */

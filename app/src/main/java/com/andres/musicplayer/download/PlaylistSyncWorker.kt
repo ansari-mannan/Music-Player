@@ -15,6 +15,7 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.andres.musicplayer.data.prefs.DownloadPreferences
 import com.andres.musicplayer.App
 import com.andres.musicplayer.R
 import com.andres.musicplayer.data.prefs.SyncInterval
@@ -49,10 +50,13 @@ class PlaylistSyncWorker(
             val result = app.playlistSync.sync()
             Log.i(TAG, "Periodic sync: ${result?.describe() ?: "skipped, already running"}")
 
-            // Downloads only actually start while the app counts as foreground, which is
-            // what setForeground above buys. If that failed, the rows stay QUEUED and
-            // start when the app is next opened.
-            if ((result?.queued ?: 0) > 0) DownloadService.ensureRunning(applicationContext)
+            // Android 12+ usually refuses to start the download service from the
+            // background, so the worker itself keeps the process alive while the engine
+            // works through the queue (anything new, plus whatever was already waiting).
+            // WorkManager allows about ten minutes; what doesn't finish resumes from its
+            // saved offset next time.
+            DownloadService.ensureRunning(applicationContext)
+            app.downloadEngine.awaitIdle(DOWNLOAD_WINDOW_MS)
             Result.success()
         } catch (e: Exception) {
             Log.w(TAG, "Periodic sync failed", e)
@@ -101,6 +105,9 @@ class PlaylistSyncWorker(
         private const val NOTIFICATION_ID = 4202
         private const val WORK_NAME = "youtube_playlist_sync"
 
+        /** Stays under WorkManager's ~10 minute execution limit. */
+        private const val DOWNLOAD_WINDOW_MS = 9L * 60 * 1000
+
         /**
          * Applies the user's chosen interval, replacing any existing schedule. Call on
          * startup and whenever the setting changes.
@@ -116,7 +123,9 @@ class PlaylistSyncWorker(
                 TimeUnit.MINUTES,
             ).setConstraints(
                 Constraints.Builder()
-                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .setRequiredNetworkType(
+                        if (DownloadPreferences(context).wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED,
+                    )
                     .build(),
             ).build()
 

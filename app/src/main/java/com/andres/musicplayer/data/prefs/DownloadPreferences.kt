@@ -37,9 +37,18 @@ class DownloadPreferences(context: Context) {
         shared(prefs).value = clamped
     }
 
+    /**
+     * Only download on an unmetered (Wi-Fi) network. Read on every pump, so a change applies
+     * to the next download that starts; one already running finishes.
+     */
+    var wifiOnly: Boolean
+        get() = prefs.getBoolean(KEY_WIFI_ONLY, false)
+        set(value) = prefs.edit().putBoolean(KEY_WIFI_ONLY, value).apply()
+
     companion object {
         private const val PREFS_NAME = "download_prefs"
         private const val KEY_CONCURRENCY = "concurrency"
+        private const val KEY_WIFI_ONLY = "wifi_only"
 
         const val MIN = 1
         const val MAX = 3

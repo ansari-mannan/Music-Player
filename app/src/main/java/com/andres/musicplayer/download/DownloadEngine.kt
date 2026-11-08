@@ -17,7 +17,11 @@ import com.andres.musicplayer.data.local.entity.DownloadEntry
 import com.andres.musicplayer.data.local.entity.DownloadEntryWithSource
 import com.andres.musicplayer.data.local.entity.DownloadState
 import com.andres.musicplayer.data.local.entity.DownloadedVideo
+import com.andres.musicplayer.data.local.entity.IgnoredVideo
 import com.andres.musicplayer.data.local.entity.Song
+import com.andres.musicplayer.App
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import com.andres.musicplayer.data.prefs.DownloadPreferences
 import com.andres.musicplayer.data.prefs.FolderPreferences
 import com.andres.musicplayer.data.tags.Mp4Tag
@@ -97,8 +101,16 @@ class DownloadEngine(
     private val metadataResolver: MetadataResolver = MusicMetadataResolver(),
     /** Injected so the pool can be tested without a live foreground service. */
     private val startService: () -> Unit = { DownloadService.ensureRunning(appContext) },
-    /** Puts a finished download into the song library. */
-    private val addToLibrary: suspend (Song) -> Unit = {},
+    /**
+     * Puts a finished download into the song library, and into the in-app playlist named
+     * after the YouTube playlist it came from (null for a hand-added link).
+     */
+    private val addToLibrary: suspend (song: Song, playlistTitle: String?) -> Unit = { _, _ -> },
+    /** Videos the user cancelled; a sync never queues these again. */
+    private val ignoredVideos: suspend () -> Set<String> = { emptySet() },
+    private val setIgnored: suspend (videoId: String, ignored: Boolean) -> Unit = { _, _ -> },
+    /** False while downloads must wait (Wi-Fi-only is on and the network is metered). */
+    private val canDownloadNow: () -> Boolean = { true },
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val http = OkHttpClient.Builder()
@@ -135,6 +147,12 @@ class DownloadEngine(
         downloadDao.entriesInState(DownloadState.COMPLETED)
 
     private var networkCallbackRegistered = false
+    private var unmeteredCallbackRegistered = false
+
+    private val _waitingForWifi = MutableStateFlow(false)
+
+    /** True while queued work is held back by the Wi-Fi-only setting. */
+    val waitingForWifi: StateFlow<Boolean> = _waitingForWifi.asStateFlow()
 
     private enum class StopReason { PAUSE, CANCEL }
 
@@ -158,6 +176,8 @@ class DownloadEngine(
     ): Boolean {
         if (downloadedVideoDao.getById(videoId) != null) return false
         if (downloadDao.getById(videoId) != null) return false
+        // Asking for it by hand overrides an earlier cancel.
+        setIgnored(videoId, false)
         downloadDao.upsert(
             DownloadEntry(
                 id = videoId,
@@ -183,6 +203,7 @@ class DownloadEngine(
         val alreadyHave = HashSet<String>()
         alreadyHave += downloadedVideoDao.allVideoIds()
         alreadyHave += downloadDao.allVideoIds()
+        alreadyHave += ignoredVideos()
 
         val fresh = candidates
             .filter { alreadyHave.add(it.videoId) }
@@ -229,6 +250,8 @@ class DownloadEngine(
      * a moment after it was removed.
      */
     fun cancel(id: String) = scope.launch {
+        // Remembered, so the next playlist sync doesn't simply queue it again.
+        downloadDao.getById(id)?.let { if (it.state != DownloadState.COMPLETED) setIgnored(it.videoId, true) }
         val job = jobs[id]
         if (job != null) {
             stopReasons[id] = StopReason.CANCEL
@@ -300,11 +323,33 @@ class DownloadEngine(
         pump()
     }
 
+    /**
+     * Keeps the caller (the background sync worker) waiting while downloads run, so the
+     * process stays alive for them even though Android won't let a background app start
+     * the download service. Gives up after [timeoutMs]; anything unfinished resumes from
+     * its saved offset next time.
+     */
+    suspend fun awaitIdle(timeoutMs: Long) {
+        withTimeoutOrNull(timeoutMs) {
+            while (true) {
+                pump()
+                if (jobs.isEmpty()) break
+                delay(2_000)
+            }
+        }
+    }
+
     // --- Pool ----------------------------------------------------------------------
 
     /** Starts as much queued work as the concurrency limit allows. */
     suspend fun pump() {
         pumpMutex.withLock {
+            if (!canDownloadNow()) {
+                _waitingForWifi.value = downloadDao.nextInState(DownloadState.QUEUED, 1).isNotEmpty()
+                if (_waitingForWifi.value) registerUnmeteredCallback()
+                return@withLock
+            }
+            _waitingForWifi.value = false
             val limit = concurrency.value
             val free = limit - jobs.size
             if (free <= 0) return@withLock
@@ -501,6 +546,7 @@ class DownloadEngine(
         // Straight into the library, so a finished download is playable now rather than
         // after the next launch's scan. That scan then sees the uri as known and skips it.
         try {
+            val playlistTitle = downloadDao.getByIdWithSource(id)?.playlistTitle
             addToLibrary(
                 Song(
                     uri = destination,
@@ -509,6 +555,7 @@ class DownloadEngine(
                     album = metadata?.tags?.album,
                     durationMs = durationMs,
                 ),
+                playlistTitle,
             )
         } catch (cancellation: CancellationException) {
             throw cancellation
@@ -680,6 +727,36 @@ class DownloadEngine(
         )
     }
 
+    /** Pumps again once an unmetered (Wi-Fi) network shows up. */
+    private fun registerUnmeteredCallback() {
+        if (unmeteredCallbackRegistered) return
+        val manager = appContext.getSystemService(ConnectivityManager::class.java) ?: return
+        unmeteredCallbackRegistered = true
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            .build()
+        runCatching {
+            manager.registerNetworkCallback(
+                request,
+                object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        scope.launch {
+                            startService()
+                            pump()
+                        }
+                    }
+                },
+            )
+        }.onFailure { unmeteredCallbackRegistered = false }
+    }
+
+    /** Re-checks the Wi-Fi-only rule now (after the setting changed). */
+    fun onNetworkPolicyChanged() = scope.launch {
+        startService()
+        pump()
+    }
+
     // --- File handling ---------------------------------------------------------------
 
     private fun partFile(id: String) = File(File(appContext.filesDir, "downloads"), "$id.part")
@@ -827,6 +904,10 @@ class DownloadEngine(
         fun from(context: Context): DownloadEngine {
             val db = AppDatabase.getInstance(context)
             val folderPrefs = FolderPreferences(context)
+            val downloadPrefs = DownloadPreferences(context)
+            val repository = (context.applicationContext as App).repository
+            val exclusions = db.exclusionDao()
+            val connectivity = context.getSystemService(ConnectivityManager::class.java)
             return DownloadEngine(
                 appContext = context.applicationContext,
                 downloadDao = db.downloadDao(),
@@ -834,9 +915,16 @@ class DownloadEngine(
                 resolver = StreamResolver(),
                 // Process-wide, so the picker in Settings and the one in the Downloads
                 // tab both reach this engine rather than each nudging a private copy.
-                concurrency = DownloadPreferences(context).concurrency,
+                concurrency = downloadPrefs.concurrency,
                 watchedFolder = { folderPrefs.watchedFolderUri },
-                addToLibrary = { song -> db.songDao().insert(song) },
+                addToLibrary = { song, playlistTitle -> repository.addDownloadedSong(song, playlistTitle) },
+                ignoredVideos = { exclusions.ignoredVideoIds().toSet() },
+                setIgnored = { videoId, ignored ->
+                    if (ignored) exclusions.ignoreVideo(IgnoredVideo(videoId)) else exclusions.unignoreVideo(videoId)
+                },
+                canDownloadNow = {
+                    !downloadPrefs.wifiOnly || connectivity?.isActiveNetworkMetered == false
+                },
             )
         }
     }

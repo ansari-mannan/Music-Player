@@ -75,7 +75,7 @@ fun DownloadsScreen(
     onManagePlaylists: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var tab by remember { mutableStateOf(DownloadTab.ACTIVE) }
+    var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(DownloadTab.ACTIVE) }
 
     Column(modifier = modifier.fillMaxSize()) {
         // Above the tabs rather than inside one: syncing is what fills all three of
@@ -174,6 +174,16 @@ internal fun playlistCountLabel(watched: Int) = when (watched) {
 @Composable
 private fun ActiveTab(downloads: DownloadsState) {
     LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+        if (downloads.waitingForWifi) {
+            item {
+                Text(
+                    text = "Waiting for Wi-Fi — \"Download on Wi-Fi only\" is on in Settings.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
+        }
         item { ConcurrencyRow(downloads) }
 
         if (downloads.active.isNotEmpty()) {
