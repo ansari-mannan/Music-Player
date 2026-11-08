@@ -42,8 +42,10 @@ fun ArtistsScreen(
     onArtistClick: (name: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val songs by repo.allSongs.collectAsState(initial = emptyList())
-    val playlists by repo.allPlaylistsWithSongs.collectAsState(initial = emptyList())
+    // null until the first load, so the empty state never flashes up while loading.
+    val loadedSongs by repo.allSongs.collectAsState(initial = null)
+    val songs = loadedSongs.orEmpty()
+    val playlists by repo.playlistSummaries.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
     var addTarget by remember { mutableStateOf<String?>(null) }
     val artists = remember(songs) {
@@ -57,6 +59,10 @@ fun ArtistsScreen(
         songs.filter { (it.artist?.takeIf { a -> a.isNotBlank() } ?: UNKNOWN_ARTIST) == artist }
             .map { it.id }
 
+    if (loadedSongs == null) {
+        com.andres.musicplayer.ui.common.LoadingState(modifier = modifier)
+        return
+    }
     if (artists.isEmpty()) {
         EmptyState(
             title = "No artists yet",

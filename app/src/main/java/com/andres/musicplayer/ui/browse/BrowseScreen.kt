@@ -66,7 +66,7 @@ fun BrowseScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val playlists by repo.allPlaylistsWithSongs.collectAsState(initial = emptyList())
+    val playlists by repo.playlistSummaries.collectAsState(initial = emptyList())
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, audioPermission) ==

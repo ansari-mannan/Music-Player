@@ -6,6 +6,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.setValue
 import coil3.ImageLoader
 import coil3.decode.DataSource
@@ -25,10 +26,14 @@ import okio.FileSystem
  * embed new art into a file) makes every [AudioArt] key change, so Coil re-reads the
  * file instead of serving the stale cached cover.
  */
-data class AudioArt(val uri: Uri, val version: Int = ArtworkVersion.value)
+data class AudioArt(val uri: Uri, val version: Int = ArtworkVersion.versionOf(uri.toString()))
 
 /**
- * Counter that invalidates cached cover art when artwork is edited.
+ * Invalidates cached cover art when artwork is edited.
+ *
+ * Per file: changing one song's cover reloads only that cover. (A single global counter
+ * used to throw away every cached cover in the library for one edit.) [bumpAll] is still
+ * there for repairs that may have touched many files.
  *
  * Persisted, because the art cache is on disk: a counter that restarted at 0 every
  * launch would bring back covers cached before an edit made in an earlier session.
@@ -36,20 +41,44 @@ data class AudioArt(val uri: Uri, val version: Int = ArtworkVersion.value)
 object ArtworkVersion {
     private const val PREFS = "artwork_cache"
     private const val KEY = "version"
+    private const val URI_PREFIX = "u:"
     private var prefs: SharedPreferences? = null
 
     var value by mutableIntStateOf(0)
         private set
 
+    private val perUri = mutableStateMapOf<String, Int>()
+
     /** Call once at startup (App.onCreate), before anything loads artwork. */
     fun init(context: Context) {
         if (prefs != null) return
         prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .also { value = it.getInt(KEY, 0) }
+            .also { p ->
+                value = p.getInt(KEY, 0)
+                p.all.forEach { (k, v) ->
+                    if (k.startsWith(URI_PREFIX) && v is Int) perUri[k.removePrefix(URI_PREFIX)] = v
+                }
+            }
     }
 
-    /** Call after embedding new artwork so visible covers reload. */
-    fun bump() {
+    /** The cache-key version for one file's cover. */
+    fun versionOf(uri: String): Int = value * 100_003 + (perUri[uri] ?: 0)
+
+    /** Call after embedding new artwork into [uri]. */
+    fun bump(uri: String) = bump(listOf(uri))
+
+    fun bump(uris: Collection<String>) {
+        val edit = prefs?.edit()
+        uris.forEach { uri ->
+            val next = (perUri[uri] ?: 0) + 1
+            perUri[uri] = next
+            edit?.putInt(URI_PREFIX + uri, next)
+        }
+        edit?.apply()
+    }
+
+    /** Reloads every cover. For bulk repairs only. */
+    fun bumpAll() {
         value++
         prefs?.edit()?.putInt(KEY, value)?.apply()
     }

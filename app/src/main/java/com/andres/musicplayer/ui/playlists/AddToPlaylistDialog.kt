@@ -18,14 +18,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.andres.musicplayer.data.local.entity.PlaylistWithSongs
+import com.andres.musicplayer.data.local.dao.PlaylistSummary
 
 /**
  * Picks a playlist to add the selected songs to (or creates a new one).
  */
 @Composable
 fun AddToPlaylistDialog(
-    playlists: List<PlaylistWithSongs>,
+    playlists: List<PlaylistSummary>,
     onPick: (playlistId: Long) -> Unit,
     onCreateNew: (name: String) -> Unit,
     onDismiss: () -> Unit,
@@ -61,12 +61,12 @@ fun AddToPlaylistDialog(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onPick(item.playlist.id) }
+                            .clickable { onPick(item.id) }
                             .padding(vertical = 10.dp),
                     ) {
-                        Text(item.playlist.name, style = MaterialTheme.typography.bodyLarge)
+                        Text(item.name, style = MaterialTheme.typography.bodyLarge)
                         Text(
-                            text = if (item.songs.size == 1) "1 song" else "${item.songs.size} songs",
+                            text = if (item.songCount == 1) "1 song" else "${item.songCount} songs",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

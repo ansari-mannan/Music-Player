@@ -44,13 +44,16 @@ import com.andres.musicplayer.ui.util.formatDuration
 @Composable
 fun SongRow(
     item: Song,
-    isPlaying: Boolean,
+    /** This row is the track loaded in the player (highlighted). */
+    isCurrent: Boolean,
     isSelected: Boolean,
     selectionMode: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier.fillMaxWidth(),
     trailing: (@Composable () -> Unit)? = null,
+    /** Bounce the equalizer bars — only while the player is actually playing. */
+    animate: Boolean = isCurrent,
 ) {
     Row(
         modifier = modifier
@@ -88,14 +91,14 @@ fun SongRow(
 
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                if (isPlaying) {
-                    AnimatedEqualizerBars()
+                if (isCurrent) {
+                    AnimatedEqualizerBars(animate = animate)
                     Spacer(Modifier.width(6.dp))
                 }
                 Text(
                     text = item.title,
                     style = MaterialTheme.typography.titleMedium,
-                    color = if (isPlaying) {
+                    color = if (isCurrent) {
                         MaterialTheme.colorScheme.primary
                     } else {
                         MaterialTheme.colorScheme.onSurface
@@ -125,7 +128,21 @@ fun SongRow(
 fun AnimatedEqualizerBars(
     modifier: Modifier = Modifier,
     color: Color = MaterialTheme.colorScheme.primary,
+    animate: Boolean = true,
 ) {
+    if (!animate) {
+        // Paused: still bars, and no animation running for nothing.
+        Canvas(modifier = modifier.size(14.dp)) {
+            val bars = 3
+            val barWidth = size.width / (bars * 2f - 1)
+            val levels = floatArrayOf(0.45f, 0.8f, 0.6f)
+            for (i in 0 until bars) {
+                val h = size.height * levels[i]
+                drawRect(color = color, topLeft = Offset(i * barWidth * 2, size.height - h), size = Size(barWidth, h))
+            }
+        }
+        return
+    }
     val transition = rememberInfiniteTransition(label = "eq")
     val bars = 3
     val heights = (0 until bars).map { i ->

@@ -56,8 +56,10 @@ fun AlbumsScreen(
     onAlbumClick: (name: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val songs by repo.allSongs.collectAsState(initial = emptyList())
-    val playlists by repo.allPlaylistsWithSongs.collectAsState(initial = emptyList())
+    // null until the first load, so the empty state never flashes up while loading.
+    val loadedSongs by repo.allSongs.collectAsState(initial = null)
+    val songs = loadedSongs.orEmpty()
+    val playlists by repo.playlistSummaries.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
     var addTarget by remember { mutableStateOf<String?>(null) }
     var manageAlbum by remember { mutableStateOf<String?>(null) }
@@ -70,7 +72,8 @@ fun AlbumsScreen(
         val album = artworkAlbum
         if (uri != null && album != null) {
             scope.launch {
-                if (repo.writeArtworkToAlbumFromUri(album, uri) > 0) ArtworkVersion.bump()
+                val written = repo.writeArtworkToAlbumFromUri(album, uri)
+                if (written.isNotEmpty()) ArtworkVersion.bump(written)
             }
         }
         artworkAlbum = null
@@ -94,6 +97,10 @@ fun AlbumsScreen(
             .sortedWith(compareBy({ it.name == UNKNOWN_ALBUM }, { it.name.lowercase() }))
     }
 
+    if (loadedSongs == null) {
+        com.andres.musicplayer.ui.common.LoadingState(modifier = modifier)
+        return
+    }
     if (albums.isEmpty()) {
         EmptyState(
             title = "No albums yet",

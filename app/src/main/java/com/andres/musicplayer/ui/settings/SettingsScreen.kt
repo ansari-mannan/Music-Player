@@ -69,6 +69,9 @@ fun SettingsScreen(
     onSyncMetadata: () -> Unit,
     onManageSyncedPlaylists: () -> Unit,
     onOpenDownloads: () -> Unit,
+    isSyncingMetadata: Boolean = false,
+    hiddenSongs: Int = 0,
+    onRestoreHiddenSongs: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -168,9 +171,9 @@ fun SettingsScreen(
                 .clickable(onClick = onOpenEqualizer)
                 .padding(horizontal = 16.dp, vertical = 10.dp),
         ) {
-            Text("Equalizer", style = MaterialTheme.typography.bodyLarge)
+            Text("Sound & equalizer", style = MaterialTheme.typography.bodyLarge)
             Text(
-                "Multi-band equalizer with presets.",
+                "Equalizer presets (Jazz, Rock…), bass boost, virtualizer, reverb, loudness boost, volume leveller.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -186,8 +189,8 @@ fun SettingsScreen(
             Column(modifier = Modifier.weight(1f)) {
                 Text("Mono audio", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    "Combines left and right channels into one — toggled instantly, in the " +
-                        "background, without interrupting playback.",
+                    "Left and right combined, the way Android's own Mono audio does it — " +
+                        "handy with a single earbud. Only affects this app.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -195,37 +198,8 @@ fun SettingsScreen(
             Spacer(Modifier.width(12.dp))
             Switch(
                 checked = mono.isOn,
-                enabled = mono.granted,
                 onCheckedChange = { mono.set(it) },
             )
-        }
-        if (!mono.granted) {
-            // Android restricts this one setting to WRITE_SECURE_SETTINGS, which only a
-            // one-time adb command can grant (no in-app popup can). Shown so it's copyable.
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    "One-time setup: connect to a PC with USB debugging and run this once " +
-                        "(Android locks this setting; no in-app prompt can grant it):",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(4.dp))
-                SelectionContainer {
-                    Text(
-                        com.andres.musicplayer.ui.util.MonoAudio.GRANT_COMMAND,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                            .padding(8.dp),
-                    )
-                }
-            }
         }
 
         HorizontalDivider()
@@ -233,15 +207,49 @@ fun SettingsScreen(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onSyncMetadata)
+                .clickable(enabled = !isSyncingMetadata, onClick = onSyncMetadata)
                 .padding(horizontal = 16.dp, vertical = 10.dp),
         ) {
             Text("Save song info to files", style = MaterialTheme.typography.bodyLarge)
             Text(
-                text = "Write every song's title, artist and album into the file itself, " +
-                    "so they survive a reinstall. MP3 and M4A only.",
+                text = if (isSyncingMetadata) {
+                    "Saving… (progress shows at the top of the screen)"
+                } else {
+                    "Write every song's title, artist and album into the file itself, " +
+                        "so they survive a reinstall. MP3 and M4A only."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        var confirmRestore by remember { mutableStateOf(false) }
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = hiddenSongs > 0) { confirmRestore = true }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        ) {
+            Text("Hidden songs", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = if (hiddenSongs == 0) {
+                    "Songs you remove from the library stay hidden from scans. None right now."
+                } else {
+                    "$hiddenSongs removed song${if (hiddenSongs == 1) "" else "s"} kept out of " +
+                        "the library. Tap to bring them all back."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (confirmRestore) {
+            AlertDialog(
+                onDismissRequest = { confirmRestore = false },
+                title = { Text("Bring back hidden songs?") },
+                text = { Text("All $hiddenSongs will be added back to your library on the next scan, which starts now.") },
+                confirmButton = {
+                    TextButton(onClick = { confirmRestore = false; onRestoreHiddenSongs() }) { Text("Bring back") }
+                },
+                dismissButton = { TextButton(onClick = { confirmRestore = false }) { Text("Cancel") } },
             )
         }
 
@@ -265,6 +273,7 @@ fun SettingsScreen(
             )
         }
         ConcurrencySetting()
+        WifiOnlySetting()
 
         HorizontalDivider()
         SectionHeader("Music folder")
@@ -410,6 +419,39 @@ private fun ConcurrencySetting() {
             Spacer(Modifier.width(12.dp))
             Text(if (value == 1) "One at a time" else "$value at a time")
         }
+    }
+}
+
+/** Only download on Wi-Fi (an unmetered network). Applies to the next download that starts. */
+@Composable
+private fun WifiOnlySetting() {
+    val context = LocalContext.current
+    val prefs = remember { DownloadPreferences(context) }
+    var wifiOnly by remember { mutableStateOf(prefs.wifiOnly) }
+    fun set(value: Boolean) {
+        wifiOnly = value
+        prefs.wifiOnly = value
+        // The background check gets the matching network rule, and queued work is re-checked.
+        PlaylistSyncWorker.schedule(context, SyncPreferences(context).interval)
+        (context.applicationContext as com.andres.musicplayer.App).downloadEngine.onNetworkPolicyChanged()
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { set(!wifiOnly) }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Download on Wi-Fi only", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "Queued songs wait for Wi-Fi instead of using mobile data.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(checked = wifiOnly, onCheckedChange = { set(it) })
     }
 }
 

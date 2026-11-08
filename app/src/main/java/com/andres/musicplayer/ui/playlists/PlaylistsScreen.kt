@@ -33,29 +33,50 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.andres.musicplayer.data.SongRepository
-import com.andres.musicplayer.data.local.entity.PlaylistWithSongs
+import com.andres.musicplayer.data.local.dao.PlaylistSummary
+import com.andres.musicplayer.ui.common.LoadingState
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.clickable
 import com.andres.musicplayer.ui.common.EmptyState
 import com.andres.musicplayer.ui.player.PlusIcon
 import kotlinx.coroutines.launch
 
-/** Grid of playlist tiles (4-up cover, name, count). Tap to open, long-press to delete. */
+/** Grid of playlist tiles (4-up cover, name, count). Tap to open, long-press to rename or delete. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun PlaylistsScreen(
     repo: SongRepository,
     onOpenPlaylist: (id: Long) -> Unit,
     modifier: Modifier = Modifier,
+    /** Set on a fresh install (no music folder yet): the screen offers to pick one instead. */
+    onPickFolder: (() -> Unit)? = null,
 ) {
-    val playlists by repo.allPlaylistsWithSongs.collectAsState(initial = emptyList())
+    // null until the first load, so an empty state never flashes up while loading.
+    val loaded by repo.playlistSummaries.collectAsState(initial = null)
+    val playlists = loaded.orEmpty()
     val scope = rememberCoroutineScope()
     var showCreate by remember { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<PlaylistWithSongs?>(null) }
+    var menuTarget by remember { mutableStateOf<PlaylistSummary?>(null) }
+    var renameTarget by remember { mutableStateOf<PlaylistSummary?>(null) }
+    var deleteTarget by remember { mutableStateOf<PlaylistSummary?>(null) }
 
     // Square cover that fills a 2-column cell (padding 16 outer, 12 gap).
     val coverSize = ((LocalConfiguration.current.screenWidthDp - 16 * 2 - 12) / 2).dp
 
     Box(modifier = modifier.fillMaxSize()) {
-        if (playlists.isEmpty()) {
+        if (onPickFolder != null) {
+            // First launch: Playlists is the start screen, so the setup step goes here.
+            EmptyState(
+                title = "Welcome to ${com.andres.musicplayer.ui.app.LocalAppTitle.current}",
+                body = "Your library lives in a folder on your phone. Tap below — the picker " +
+                    "opens in your Music folder, so just tap \"Use this folder\" and then \"Allow\".",
+                buttonText = "Use my Music folder",
+                onButtonClick = onPickFolder,
+            )
+            return@Box
+        } else if (loaded == null) {
+            LoadingState()
+        } else if (playlists.isEmpty()) {
             EmptyState(
                 title = "No playlists yet",
                 body = "Tap + to create one.",
@@ -68,23 +89,23 @@ fun PlaylistsScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                items(items = playlists, key = { it.playlist.id }) { item ->
+                items(items = playlists, key = { it.id }) { item ->
                     Column(
                         modifier = Modifier.combinedClickable(
-                            onClick = { onOpenPlaylist(item.playlist.id) },
-                            onLongClick = { deleteTarget = item },
+                            onClick = { onOpenPlaylist(item.id) },
+                            onLongClick = { menuTarget = item },
                         ),
                     ) {
-                        PlaylistCollage(uris = item.songs.map { it.uri }, size = coverSize)
+                        PlaylistCollage(uris = item.covers, size = coverSize)
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            item.playlist.name,
+                            item.name,
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = if (item.songs.size == 1) "1 song" else "${item.songs.size} songs",
+                            text = if (item.songCount == 1) "1 song" else "${item.songCount} songs",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -117,14 +138,56 @@ fun PlaylistsScreen(
         )
     }
 
+    menuTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { menuTarget = null },
+            title = { Text(target.name) },
+            text = {
+                Column {
+                    Text(
+                        "Rename",
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { renameTarget = target; menuTarget = null }
+                            .padding(vertical = 12.dp),
+                    )
+                    Text(
+                        "Delete",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { deleteTarget = target; menuTarget = null }
+                            .padding(vertical = 12.dp),
+                    )
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { menuTarget = null }) { Text("Cancel") } },
+        )
+    }
+
+    renameTarget?.let { target ->
+        PlaylistNameDialog(
+            title = "Rename playlist",
+            initial = target.name,
+            onDismiss = { renameTarget = null },
+            onConfirm = { name ->
+                scope.launch { repo.renamePlaylist(target.id, name) }
+                renameTarget = null
+            },
+        )
+    }
+
     deleteTarget?.let { target ->
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
-            title = { Text("Delete \"${target.playlist.name}\"?") },
+            title = { Text("Delete \"${target.name}\"?") },
             text = { Text("The playlist is removed. Your songs stay in the library.") },
             confirmButton = {
                 TextButton(onClick = {
-                    scope.launch { repo.deletePlaylist(target.playlist.id) }
+                    scope.launch { repo.deletePlaylist(target.id) }
                     deleteTarget = null
                 }) { Text("Delete") }
             },

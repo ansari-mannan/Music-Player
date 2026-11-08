@@ -26,6 +26,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,19 +47,28 @@ fun EditInfoDialog(
     song: Song,
     onDismiss: () -> Unit,
     onSave: (title: String, artist: String?, album: String?) -> Unit,
-    onChangeArtwork: ((Uri) -> Unit)? = null,
+    /** Writes the picked image into the file; returns whether it worked. */
+    onChangeArtwork: (suspend (Uri) -> Boolean)? = null,
 ) {
+    val scope = rememberCoroutineScope()
     var title by remember { mutableStateOf(song.title) }
     var artist by remember { mutableStateOf(song.artist.orEmpty()) }
     var album by remember { mutableStateOf(song.album.orEmpty()) }
-    var artworkChanged by remember { mutableStateOf(false) }
+    // null = untouched, then saving / saved / failed.
+    var artworkStatus by remember { mutableStateOf<String?>(null) }
 
     val artworkPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent(),
     ) { uri ->
         if (uri != null && onChangeArtwork != null) {
-            onChangeArtwork(uri)
-            artworkChanged = true
+            artworkStatus = "Saving artwork…"
+            scope.launch {
+                artworkStatus = if (onChangeArtwork(uri)) {
+                    "Artwork saved into the file."
+                } else {
+                    "Couldn't save artwork into this file (unsupported format or read-only)."
+                }
+            }
         }
     }
 
@@ -92,11 +103,7 @@ fun EditInfoDialog(
                         }
                         Spacer(Modifier.width(12.dp))
                         Text(
-                            text = if (artworkChanged) {
-                                "Artwork updated — saved into the file."
-                            } else {
-                                "Tap the cover to choose a new thumbnail."
-                            },
+                            text = artworkStatus ?: "Tap the cover to choose a new thumbnail.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
