@@ -35,9 +35,13 @@ android {
     }
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            // R8: removes unused code and optimises the rest. The single biggest
+            // smoothness win for Compose on a low-end phone. Rules in proguard-rules.pro.
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             signingConfig = signingConfigs.getByName("release")
         }
     }
@@ -112,6 +116,8 @@ dependencies {
     // Audio playback + effects (wired up in the playback step).
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.session)
+    // Trim / cut tool: clips and joins audio, re-encoding to AAC.
+    implementation(libs.androidx.media3.transformer)
 
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
