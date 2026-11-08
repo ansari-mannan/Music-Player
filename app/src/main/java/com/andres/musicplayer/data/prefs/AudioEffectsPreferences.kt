@@ -45,8 +45,37 @@ class AudioEffectsPreferences(context: Context) {
         get() = prefs.getInt(KEY_VIRT_STRENGTH, 0).toShort()
         set(value) = prefs.edit().putInt(KEY_VIRT_STRENGTH, value.toInt()).apply()
 
+    /** Equalizer preset last chosen, or -1 for a custom curve (bands moved by hand). */
+    var eqPreset: Int
+        get() = prefs.getInt(KEY_EQ_PRESET, -1)
+        set(value) = prefs.edit().putInt(KEY_EQ_PRESET, value).apply()
+
+    /** PresetReverb preset (PresetReverb.PRESET_*); 0 = none. */
+    var reverbPreset: Int
+        get() = prefs.getInt(KEY_REVERB_PRESET, 0)
+        set(value) = prefs.edit().putInt(KEY_REVERB_PRESET, value).apply()
+
+    var loudnessEnabled: Boolean
+        get() = prefs.getBoolean(KEY_LOUDNESS_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_LOUDNESS_ENABLED, value).apply()
+
+    /** Loudness enhancer target gain in millibels (0–1500). */
+    var loudnessGainMb: Int
+        get() = prefs.getInt(KEY_LOUDNESS_GAIN, 600)
+        set(value) = prefs.edit().putInt(KEY_LOUDNESS_GAIN, value).apply()
+
+    /** Volume leveller (compressor + limiter via DynamicsProcessing). */
+    var levelerEnabled: Boolean
+        get() = prefs.getBoolean(KEY_LEVELER_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_LEVELER_ENABLED, value).apply()
+
     companion object {
         private const val PREFS_NAME = "audio_effects_prefs"
+        private const val KEY_EQ_PRESET = "eq_preset"
+        private const val KEY_REVERB_PRESET = "reverb_preset"
+        private const val KEY_LOUDNESS_ENABLED = "loudness_enabled"
+        private const val KEY_LOUDNESS_GAIN = "loudness_gain_mb"
+        private const val KEY_LEVELER_ENABLED = "leveler_enabled"
         private const val KEY_EQ_ENABLED = "eq_enabled"
         private const val KEY_EQ_BANDS = "eq_bands"
         private const val KEY_BASS_ENABLED = "bass_enabled"

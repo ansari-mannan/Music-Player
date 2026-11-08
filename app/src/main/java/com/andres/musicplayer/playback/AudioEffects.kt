@@ -1,132 +1,163 @@
 package com.andres.musicplayer.playback
 
 import android.content.Context
-import android.media.audiofx.BassBoost
-import android.media.audiofx.Equalizer
-import android.media.audiofx.Virtualizer
-import androidx.media3.common.C
 import com.andres.musicplayer.data.prefs.AudioEffectsPreferences
 
 /**
- * Process-wide bridge between the UI and the system audio effects applied to the
- * ExoPlayer's audio session in [PlaybackService]: equalizer, bass boost, and
- * virtualizer.
+ * The single place the UI changes sound settings. Every setter applies the change AND
+ * saves it, so "applied now" and "saved for next time" can never drift apart.
  *
- * All changes go through the setters here, which apply the change to the live effect
- * AND persist it via [AudioEffectsPreferences] in one step — so "applied now" and
- * "saved for next time" can never drift apart. When effects are (re)created on a fresh
- * audio session, the saved values are read back and re-applied immediately.
+ * Every effect — equalizer, bass boost, virtualizer, reverb, volume leveller, loudness
+ * boost — is computed by [InAppEffectsProcessor] inside the player. Nothing is attached
+ * to an Android audio session any more: the phone maker's versions of the classic effects
+ * were broken on some phones, and the player doesn't reliably report which session it
+ * really plays on, so session-attached effects could end up processing silence.
  */
 object AudioEffects {
 
     private var prefs: AudioEffectsPreferences? = null
 
-    var equalizer: Equalizer? = null
-        private set
-    var bassBoost: BassBoost? = null
-        private set
-    var virtualizer: Virtualizer? = null
-        private set
-
-    /** Call once at startup (e.g. App.onCreate) so saved settings are available. */
+    /** Call once at startup (App.onCreate), before playback starts. */
     fun init(context: Context) {
-        if (prefs == null) prefs = AudioEffectsPreferences(context.applicationContext)
+        if (prefs != null) return
+        prefs = AudioEffectsPreferences(context.applicationContext)
+        pushDsp()
     }
 
-    /** Attaches the system effects to the player's audio session and restores saved state. */
-    fun ensureEffects(audioSessionId: Int) {
-        if (audioSessionId == C.AUDIO_SESSION_ID_UNSET || audioSessionId == 0) return
-        if (equalizer == null) {
-            equalizer = runCatching { Equalizer(0, audioSessionId) }.getOrNull()
-                ?.also { applyEqFromPrefs(it) }
-        }
-        if (bassBoost == null) {
-            bassBoost = runCatching { BassBoost(0, audioSessionId) }.getOrNull()
-                ?.also { applyBassFromPrefs(it) }
-        }
-        if (virtualizer == null) {
-            virtualizer = runCatching { Virtualizer(0, audioSessionId) }.getOrNull()
-                ?.also { applyVirtualizerFromPrefs(it) }
-        }
-    }
-
-    // --- Equalizer ---
-
-    fun setEqEnabled(value: Boolean) {
-        equalizer?.let { runCatching { it.enabled = value } }
-        prefs?.eqEnabled = value
-    }
-
-    fun setEqBandLevel(band: Short, level: Short) {
-        val eq = equalizer ?: return
-        runCatching { eq.setBandLevel(band, level) }
-        prefs?.eqBands = readBands(eq)
-    }
-
-    fun applyEqPreset(preset: Short) {
-        val eq = equalizer ?: return
-        runCatching { eq.usePreset(preset) }
-        prefs?.eqBands = readBands(eq)
-    }
-
-    private fun readBands(eq: Equalizer): List<Short> =
-        (0 until eq.numberOfBands.toInt()).map {
-            runCatching { eq.getBandLevel(it.toShort()) }.getOrDefault(0)
-        }
-
-    private fun applyEqFromPrefs(eq: Equalizer) {
+    /** Sends the in-app effect settings to the audio thread. */
+    private fun pushDsp() {
         val p = prefs ?: return
-        val bands = p.eqBands
-        if (bands.isNotEmpty() && bands.size == eq.numberOfBands.toInt()) {
-            bands.forEachIndexed { i, level ->
-                runCatching { eq.setBandLevel(i.toShort(), level) }
-            }
-        }
-        runCatching { eq.enabled = p.eqEnabled }
+        DspState.update(
+            DspSettings(
+                eqEnabled = p.eqEnabled,
+                eqGainsDb = eqGainsDb,
+                bassEnabled = p.bassEnabled,
+                bassStrength = p.bassStrength.toInt(),
+                virtEnabled = p.virtualizerEnabled,
+                virtStrength = p.virtualizerStrength.toInt(),
+                reverbPreset = p.reverbPreset,
+                levellerEnabled = p.levelerEnabled,
+                loudnessEnabled = p.loudnessEnabled,
+                loudnessGainMb = p.loudnessGainMb,
+            ),
+        )
     }
 
-    // --- Bass boost ---
+    // --- Equalizer (in-app) ---
 
+    val eqBandFrequencies: DoubleArray get() = InAppEffectsProcessor.EQ_FREQUENCIES
+    val eqMaxDb: Int get() = InAppEffectsProcessor.EQ_MAX_DB
+    val eqPresetNames: List<String> = InAppEffectsProcessor.EQ_PRESETS.map { it.first }
+
+    val eqEnabled: Boolean get() = prefs?.eqEnabled == true
+
+    /** Five band gains in dB. Saved as millibels, as before, so old settings carry over. */
+    val eqGainsDb: List<Float>
+        get() = prefs?.eqBands?.takeIf { it.size == 5 }?.map { it / 100f } ?: List(5) { 0f }
+
+    /** The preset last applied, or -1 for a custom curve. */
+    val eqPreset: Int get() = prefs?.eqPreset ?: -1
+
+    /** Turning the equalizer off also sets it back to flat. */
+    fun setEqEnabled(value: Boolean) {
+        prefs?.eqEnabled = value
+        if (!value) {
+            prefs?.eqBands = List(5) { 0.toShort() }
+            prefs?.eqPreset = FLAT_PRESET
+        }
+        pushDsp()
+    }
+
+    /** Index of "Flat" in [eqPresetNames]. */
+    val FLAT_PRESET: Int = InAppEffectsProcessor.EQ_PRESETS.indexOfFirst { it.first == "Flat" }
+
+    fun setEqBandDb(band: Int, db: Float) {
+        val gains = eqGainsDb.toMutableList()
+        if (band !in gains.indices) return
+        gains[band] = db.coerceIn(-eqMaxDb.toFloat(), eqMaxDb.toFloat())
+        prefs?.eqBands = gains.map { (it * 100).toInt().toShort() }
+        prefs?.eqPreset = -1 // moved by hand: now a custom curve
+        prefs?.eqEnabled = true // moving a slider switches the equalizer on
+        pushDsp()
+    }
+
+    fun applyEqPreset(index: Int) {
+        val gains = InAppEffectsProcessor.EQ_PRESETS.getOrNull(index)?.second ?: return
+        prefs?.eqBands = gains.map { (it * 100).toShort() }
+        prefs?.eqPreset = index
+        prefs?.eqEnabled = true
+        pushDsp()
+    }
+
+    // --- Bass boost (in-app) ---
+
+    val bassEnabled: Boolean get() = prefs?.bassEnabled == true
+    val bassStrength: Short get() = prefs?.bassStrength ?: 0
+
+    /** Turning it off also brings the strength back to zero. */
     fun setBassEnabled(value: Boolean) {
-        bassBoost?.let { runCatching { it.enabled = value } }
         prefs?.bassEnabled = value
+        if (!value) prefs?.bassStrength = 0
+        pushDsp()
     }
 
     fun setBassStrength(value: Short) {
-        bassBoost?.let { runCatching { it.setStrength(value) } }
         prefs?.bassStrength = value
+        pushDsp()
     }
 
-    private fun applyBassFromPrefs(bass: BassBoost) {
-        val p = prefs ?: return
-        runCatching { if (bass.strengthSupported) bass.setStrength(p.bassStrength) }
-        runCatching { bass.enabled = p.bassEnabled }
-    }
+    // --- Virtualizer (in-app) ---
 
-    // --- Virtualizer ---
+    val virtualizerEnabled: Boolean get() = prefs?.virtualizerEnabled == true
+    val virtualizerStrength: Short get() = prefs?.virtualizerStrength ?: 0
 
+    /** Turning it off also brings the strength back to zero. */
     fun setVirtualizerEnabled(value: Boolean) {
-        virtualizer?.let { runCatching { it.enabled = value } }
         prefs?.virtualizerEnabled = value
+        if (!value) prefs?.virtualizerStrength = 0
+        pushDsp()
     }
 
     fun setVirtualizerStrength(value: Short) {
-        virtualizer?.let { runCatching { it.setStrength(value) } }
         prefs?.virtualizerStrength = value
+        pushDsp()
     }
 
-    private fun applyVirtualizerFromPrefs(virt: Virtualizer) {
-        val p = prefs ?: return
-        runCatching { if (virt.strengthSupported) virt.setStrength(p.virtualizerStrength) }
-        runCatching { virt.enabled = p.virtualizerEnabled }
+    // --- Reverb (in-app) ---
+
+    /** Android's reverb presets (index = PresetReverb.PRESET_*), names as shown. */
+    val reverbPresetNames: List<String> = InAppEffectsProcessor.REVERB_PRESETS.map { it.name }
+
+    val reverbPreset: Int get() = prefs?.reverbPreset ?: 0
+
+    fun setReverbPreset(preset: Int) {
+        prefs?.reverbPreset = preset
+        pushDsp()
     }
 
-    fun release() {
-        equalizer?.release()
-        bassBoost?.release()
-        virtualizer?.release()
-        equalizer = null
-        bassBoost = null
-        virtualizer = null
+    // --- Loudness boost (in-app) ---
+
+    val loudnessEnabled: Boolean get() = prefs?.loudnessEnabled == true
+    val loudnessGainMb: Int get() = prefs?.loudnessGainMb ?: 600
+
+    /** Turning it off also brings the boost back to zero. */
+    fun setLoudnessEnabled(value: Boolean) {
+        prefs?.loudnessEnabled = value
+        if (!value) prefs?.loudnessGainMb = 0
+        pushDsp()
+    }
+
+    fun setLoudnessGain(mb: Int) {
+        prefs?.loudnessGainMb = mb
+        pushDsp()
+    }
+
+    // --- Volume leveller (in-app) ---
+
+    val levelerEnabled: Boolean get() = prefs?.levelerEnabled == true
+
+    fun setLevelerEnabled(value: Boolean) {
+        prefs?.levelerEnabled = value
+        pushDsp()
     }
 }

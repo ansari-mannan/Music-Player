@@ -7,6 +7,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -22,36 +23,19 @@ import kotlinx.coroutines.withContext
 data class ArtSaveRequest(val uri: String, val title: String)
 
 /**
- * Controls the system "Mono audio" toggle from the UI. [isOn] is observable state;
- * [granted] reports whether the one-time WRITE_SECURE_SETTINGS grant is in place; [set]
- * flips it (showing a setup hint if the grant is missing, since Android won't let any
- * in-app popup change this particular setting).
+ * Mono audio, done inside the player (see [com.andres.musicplayer.playback.InAppEffectsProcessor]).
+ * [isOn] is observable; [granted] is always true now that no special permission is needed,
+ * and is kept so callers didn't have to change shape.
  */
-class MonoController(val isOn: Boolean, val granted: Boolean, val set: (Boolean) -> Unit) {
+class MonoController(val isOn: Boolean, val set: (Boolean) -> Unit) {
+    val granted: Boolean get() = true
     fun toggle() = set(!isOn)
 }
 
 @Composable
 fun rememberMonoController(): MonoController {
-    val context = LocalContext.current
-    var on by remember { mutableStateOf(MonoAudio.isEnabled(context)) }
-    val granted = MonoAudio.hasPermission(context)
-
-    return MonoController(
-        isOn = on,
-        granted = granted,
-        set = { target ->
-            if (MonoAudio.setEnabled(context, target)) {
-                on = MonoAudio.isEnabled(context)
-            } else {
-                Toast.makeText(
-                    context,
-                    "Mono audio needs a one-time PC setup — see the note under the switch in Settings.",
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        },
-    )
+    val on by com.andres.musicplayer.playback.PlaybackPrefs.mono.collectAsState()
+    return MonoController(isOn = on, set = { com.andres.musicplayer.playback.PlaybackPrefs.setMono(it) })
 }
 
 /**
