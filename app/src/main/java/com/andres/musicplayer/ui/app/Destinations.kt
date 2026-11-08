@@ -26,10 +26,12 @@ object Routes {
     const val ARTIST_SONGS = "artist/{name}"
     const val ALBUM_SONGS = "album/{name}"
     const val PLAYLIST_DETAIL = "playlist/{id}"
+    const val TRIM = "trim/{id}"
 
     fun artistSongs(encodedName: String) = "artist/$encodedName"
     fun albumSongs(encodedName: String) = "album/$encodedName"
     fun playlistDetail(id: Long) = "playlist/$id"
+    fun trim(songId: Long) = "trim/$songId"
 }
 
 /** A bottom-navigation destination. */
