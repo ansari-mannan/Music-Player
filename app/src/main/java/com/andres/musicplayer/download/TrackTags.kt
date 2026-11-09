@@ -31,7 +31,9 @@ internal data class TrackTags(
  *   the song name — nothing to parse.
  * - Otherwise a **"Artist - Title"** video title is the near-universal convention, and is
  *   more useful than the channel, which is typically a label or a VEVO account
- *   ("DaftPunkVEVO") rather than a name anyone wants to browse by.
+ *   ("DaftPunkVEVO") rather than a name anyone wants to browse by. A "Title - Artist"
+ *   title is turned round only when its right-hand side is the uploading channel —
+ *   for a fan page's upload there is nothing to tell the two orders apart.
  * - Failing both, the channel name is better than nothing.
  *
  * Nothing is stripped from the title — "(Official Video)" is noise, but "(Remix)",
@@ -77,7 +79,15 @@ private fun guessTags(
         return TrackTags(title = title, artist = topicArtist, album = album)
     }
 
-    val split = splitArtistAndTitle(title)
+    val split = splitArtistAndTitle(title)?.let { (left, right) ->
+        // "Song - Artist" is common enough to check for: when only the right-hand side
+        // is the uploading channel, the right-hand side is the artist.
+        if (channel != null && namesMatch(right, channel) && !namesMatch(left, channel)) {
+            right to left
+        } else {
+            left to right
+        }
+    }
     return TrackTags(
         title = split?.second ?: title,
         artist = split?.first ?: channel,
@@ -86,6 +96,26 @@ private fun guessTags(
 }
 
 private fun String.trimOrNull(): String? = trim().takeIf { it.isNotEmpty() }
+
+/**
+ * True when a piece of a title names the uploading channel: "Sia" matches "SiaVEVO" and
+ * "Sia Official", but not a channel that merely shares a letter or two with it.
+ */
+private fun namesMatch(name: String, channel: String): Boolean {
+    val a = name.normalisedName()
+    val b = channel.normalisedName()
+    if (a.length < MIN_MATCH_LENGTH || b.length < MIN_MATCH_LENGTH) return false
+    return a == b || a.contains(b) || b.contains(a)
+}
+
+private fun String.normalisedName(): String = lowercase()
+    .removeSuffix(TOPIC_SUFFIX.lowercase())
+    .replace(CHANNEL_NOISE, "")
+    .filter { it.isLetterOrDigit() }
+
+/** Words labels and fan pages bolt onto a channel name that are never part of the artist. */
+private val CHANNEL_NOISE = Regex("""vevo|official|music|\btv\b|channel""")
+private const val MIN_MATCH_LENGTH = 3
 
 /**
  * Splits `"Artist - Song"` into its two halves, or returns null when the title isn't
