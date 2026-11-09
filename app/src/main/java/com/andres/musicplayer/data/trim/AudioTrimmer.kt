@@ -376,10 +376,6 @@ object AudioTrimmer {
                         }
                     })
                     .build()
-                cont.invokeOnCancellation {
-                    transformer.cancel()
-                    output.delete()
-                }
                 transformer.start(composition, output.absolutePath)
 
                 val holder = ProgressHolder()
@@ -391,7 +387,13 @@ object AudioTrimmer {
                         delay(200)
                     }
                 }
-                cont.invokeOnCancellation { poller.cancel() }
+                // One handler only: a continuation refuses a second invokeOnCancellation
+                // with IllegalStateException, which is what broke every save.
+                cont.invokeOnCancellation {
+                    poller.cancel()
+                    transformer.cancel()
+                    output.delete()
+                }
             }
         }
     }
